@@ -1,0 +1,86 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/raven-types",
+    "crates/config-system",
+    "crates/model-router",
+    "crates/tool-system",
+    "crates/context-engine",
+    "crates/raven-core",
+    "crates/http-api",
+    "crates/tui",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Raven Team"]
+license = "MIT"
+repository = "https://github.com/user/raven"
+description = "Raven 🐦‍⬛ — A sharp, cross-platform AI agent in Rust. 轻量、快速、跨平台的 Rust AI Agent。Think like a raven. Code like the wind."
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.45", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = "0.7"
+
+# HTTP
+axum = { version = "0.8", features = ["macros"] }
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Errors
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Shared types (workspace local)
+raven-types = { path = "crates/raven-types" }
+tui = { path = "crates/tui" }
+config-system = { path = "crates/config-system" }
+model-router = { path = "crates/model-router" }
+tool-system = { path = "crates/tool-system" }
+context-engine = { path = "crates/context-engine" }
+raven-core = { path = "crates/raven-core" }
+http-api = { path = "crates/http-api" }
+cli = { path = "crates/cli" }
+
+# CLI TUI
+ratatui = "0.29"
+crossterm = "0.29"
+
+# Other
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.16", features = ["v4", "serde"] }
+clap = { version = "4.5", features = ["derive"] }
+dirs = "6.0"
+sha2 = "0.10"
+async-trait = "0.1"
+futures = "0.3"
+atty = "0.2"
+regex = "1.11"
+urlencoding = "2.1"
+futures-util = "0.3"
+bytes = "1.11"
+eventsource-stream = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true

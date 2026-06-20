@@ -1,0 +1,28 @@
+[package]
+name = "cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+description = "Raven — A sharp, cross-platform AI agent. CLI entry point."
+
+[[bin]]
+name = "raven"
+path = "src/main.rs"
+
+[dependencies]
+raven-types = { workspace = true }
+raven-core = { workspace = true }
+config-system = { workspace = true }
+http-api = { workspace = true }
+tui = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+dirs = { workspace = true }
+toml = { workspace = true }

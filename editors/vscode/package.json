@@ -1,0 +1,145 @@
+{
+  "name": "raven",
+  "displayName": "Raven - AI Agent",
+  "description": "Raven 🐦‍⬛ — A sharp, cross-platform AI agent. Think like a raven. Code like the wind.",
+  "version": "0.1.0",
+  "publisher": "raven",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Machine Learning",
+    "Chat",
+    "Programming Languages"
+  ],
+  "keywords": [
+    "ai",
+    "agent",
+    "chatgpt",
+    "claude",
+    "assistant",
+    "llm"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "agentFramework.openChat",
+        "title": "Open Chat",
+        "category": "Agent",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "agentFramework.explainCode",
+        "title": "Explain Selected Code",
+        "category": "Agent"
+      },
+      {
+        "command": "agentFramework.fixCode",
+        "title": "Fix Selected Code",
+        "category": "Agent"
+      },
+      {
+        "command": "agentFramework.generateTests",
+        "title": "Generate Tests for Selected Code",
+        "category": "Agent"
+      },
+      {
+        "command": "agentFramework.sendToChat",
+        "title": "Send to Agent Chat",
+        "category": "Agent"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "submenu": "agentFramework.editorMenu",
+          "group": "2_agent@1",
+          "when": "editorHasSelection"
+        }
+      ],
+      "agentFramework.editorMenu": [
+        {
+          "command": "agentFramework.explainCode",
+          "group": "1_agent@1"
+        },
+        {
+          "command": "agentFramework.fixCode",
+          "group": "1_agent@2"
+        },
+        {
+          "command": "agentFramework.generateTests",
+          "group": "1_agent@3"
+        },
+        {
+          "command": "agentFramework.sendToChat",
+          "group": "1_agent@4"
+        }
+      ]
+    },
+    "submenus": [
+      {
+        "id": "agentFramework.editorMenu",
+        "label": "Raven",
+        "icon": "$(robot)"
+      }
+    ],
+    "configuration": {
+      "title": "Raven",
+      "properties": {
+        "agentFramework.api.baseUrl": {
+          "type": "string",
+          "default": "http://localhost:8080",
+          "description": "Raven HTTP API base URL"
+        },
+        "agentFramework.api.timeout": {
+          "type": "number",
+          "default": 30000,
+          "description": "API request timeout (ms)"
+        },
+        "agentFramework.chat.showToolCalls": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show tool call indicators in chat"
+        },
+        "agentFramework.code.autoInsert": {
+          "type": "boolean",
+          "default": true,
+          "description": "Auto-insert code suggestions into editor"
+        }
+      }
+    },
+    "views": {
+      "explorer": [
+        {
+          "id": "agentFramework.chatView",
+          "name": "Agent Chat",
+          "when": "agentFramework.enabled"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "agentFramework",
+          "title": "Raven",
+          "icon": "$(comment-discussion)"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  }
+}

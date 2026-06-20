@@ -1,0 +1,21 @@
+[package]
+name = "tool-system"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+description = "Tool registry and execution system"
+
+[dependencies]
+raven-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+reqwest = { workspace = true }
+regex = { workspace = true }
+urlencoding = { workspace = true }

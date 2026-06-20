@@ -1,0 +1,26 @@
+[package]
+name = "tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+description = "Interactive REPL using rustyline + markdown rendering"
+
+[dependencies]
+raven-types = { workspace = true }
+raven-core = { workspace = true }
+config-system = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+dirs = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+# REPL 输入（成熟库，自动处理中文/光标/粘贴/Ctrl+C）
+rustyline = "15"
+
+# Markdown 渲染
+pulldown-cmark = "0.13"
+
+# 代码语法高亮
+syntect = "5"
