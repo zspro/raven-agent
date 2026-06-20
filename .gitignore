@@ -1,5 +1,7 @@
 # Rust 构建产物
 /target
+# 任意子 crate / 独立 workspace 的 target（如 desktop/src-tauri/target）
+**/target/
 
 # 根目录误放的二进制（历史上出现过签入的二进制）
 /agent

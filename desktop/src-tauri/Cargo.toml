@@ -1,0 +1,28 @@
+[package]
+name = "raven-desktop"
+version = "0.1.0"
+description = "Raven Desktop App"
+edition = "2021"
+rust-version = "1.70"
+
+[build-dependencies]
+tauri-build = { version = "1.5", features = [] }
+
+[dependencies]
+tauri = { version = "1.6", features = ["shell-open", "http-all", "dialog-open", "dialog-save", "fs-create-dir", "fs-read-dir", "fs-read-file", "fs-write-file", "notification-all", "path-all"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.45", features = ["full"] }
+raven-types = { path = "../../crates/raven-types" }
+raven-core = { path = "../../crates/raven-core" }
+config-system = { path = "../../crates/config-system" }
+context-engine = { path = "../../crates/context-engine" }
+model-router = { path = "../../crates/model-router" }
+tool-system = { path = "../../crates/tool-system" }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[workspace]
+# 独立 workspace，依赖外部 crates
