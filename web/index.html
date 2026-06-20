@@ -57,6 +57,9 @@
         .message .content code { background: var(--code-bg); padding: 2px 5px; border-radius: 3px; font-family: 'Courier New', monospace; font-size: 12px; }
         .message .content pre { background: var(--code-bg); padding: 10px; border-radius: 6px; overflow-x: auto; margin: 6px 0; }
         .message .content pre code { padding: 0; background: none; }
+        .message .content table { border-collapse: collapse; margin: 8px 0; font-size: 13px; white-space: normal; }
+        .message .content table th, .message .content table td { border: 1px solid var(--border, #444); padding: 5px 10px; text-align: left; vertical-align: top; }
+        .message .content table th { background: var(--code-bg); font-weight: 600; }
         .tool-call-badge { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; background: rgba(217, 164, 30, 0.1); border: 1px solid rgba(217, 164, 30, 0.25); border-radius: 4px; font-size: 11px; color: #d9a41e; margin-bottom: 6px; }
         .tool-result details { font-size: 11px; color: var(--text-secondary); margin-top: 4px; }
         .tool-result summary { cursor: pointer; }
@@ -355,11 +358,65 @@
         }
 
         function formatContent(text) {
-            return escapeHtml(text)
-                .replace(/```([\s\S]*?)```/g, '<pre><code>$1</code></pre>')
+            // 先抽取代码块，用占位符保护，避免块内 | 被误判为表格、内容被转义破坏
+            const blocks = [];
+            let t = text.replace(/```(?:[\w-]*)\n?([\s\S]*?)```/g, (_, code) => {
+                blocks.push('<pre><code>' + escapeHtml(code) + '</code></pre>');
+                return ' BLOCK' + (blocks.length - 1) + ' ';
+            });
+
+            // 按行扫描，把连续的 markdown 表格块转成 <table>
+            const lines = t.split('\n');
+            const out = [];
+            let i = 0;
+            while (i < lines.length) {
+                if (isTableRow(lines[i]) && i + 1 < lines.length && isTableSep(lines[i + 1])) {
+                    const header = splitRow(lines[i]);
+                    i += 2; // 跳过表头与分隔行
+                    const rows = [];
+                    while (i < lines.length && isTableRow(lines[i])) {
+                        rows.push(splitRow(lines[i]));
+                        i++;
+                    }
+                    out.push(buildTable(header, rows));
+                } else {
+                    out.push(formatInline(lines[i]));
+                    i++;
+                }
+            }
+
+            let html = out.join('<br>');
+            // 还原代码块（去掉其后多余的 <br>，块本身已是块级元素）
+            html = html.replace(/ BLOCK(\d+) /g, (_, n) => blocks[+n]);
+            return html;
+        }
+
+        function isTableRow(line) {
+            return /^\s*\|.*\|\s*$/.test(line);
+        }
+        function isTableSep(line) {
+            return /^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)+\|?\s*$/.test(line);
+        }
+        function splitRow(line) {
+            return line.trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim());
+        }
+        function buildTable(header, rows) {
+            const th = header.map(c => '<th>' + formatInline(c) + '</th>').join('');
+            const body = rows.map(r => {
+                const tds = [];
+                for (let j = 0; j < header.length; j++) {
+                    tds.push('<td>' + formatInline(r[j] || '') + '</td>');
+                }
+                return '<tr>' + tds.join('') + '</tr>';
+            }).join('');
+            return '<table><thead><tr>' + th + '</tr></thead><tbody>' + body + '</tbody></table>';
+        }
+
+        // 行内 markdown（不含换行/表格/代码块）
+        function formatInline(line) {
+            return escapeHtml(line)
                 .replace(/`([^`]+)`/g, '<code>$1</code>')
-                .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-                .replace(/\n/g, '<br>');
+                .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
         }
 
         function escapeHtml(text) {

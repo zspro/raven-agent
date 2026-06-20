@@ -1246,12 +1246,39 @@ fn visible_width(s: &str) -> usize {
             i += 2;
             continue;
         }
-        // UTF-8 宽度近似：CJK 字符计 2，其他计 1
         let ch = s[i..].chars().next().unwrap_or(' ');
-        w += if ch as u32 > 0x2000 { 2 } else { 1 };
+        w += char_display_width(ch);
         i += ch.len_utf8();
     }
     w
+}
+
+/// 终端列宽：East Asian Wide/Fullwidth 计 2，其余计 1。
+/// 注意：箭头(→)、项目符号(•)、表格边框(│) 等符号虽码位 > 0x2000，但终端按 1 列显示，
+/// 不能简单按 `c > 0x2000` 判 2 列，否则填充多算导致表格列错位。
+fn char_display_width(c: char) -> usize {
+    let u = c as u32;
+    // 零宽字符
+    if u == 0 || (0x0300..=0x036F).contains(&u) {
+        return 0;
+    }
+    let wide = matches!(u,
+        0x1100..=0x115F |   // 谚文 Jamo
+        0x2E80..=0x303E |   // CJK 部首、康熙部首、CJK 符号与标点
+        0x3041..=0x33FF |   // 平假名、片假名、注音、CJK 兼容
+        0x3400..=0x4DBF |   // CJK 扩展 A
+        0x4E00..=0x9FFF |   // CJK 统一表意文字
+        0xA000..=0xA4CF |   // 彝文
+        0xAC00..=0xD7A3 |   // 谚文音节
+        0xF900..=0xFAFF |   // CJK 兼容表意文字
+        0xFE10..=0xFE19 |   // 竖排标点
+        0xFE30..=0xFE6F |   // CJK 兼容形式、小写变体
+        0xFF00..=0xFF60 |   // 全角 ASCII、全角标点
+        0xFFE0..=0xFFE6 |   // 全角符号
+        0x1F300..=0x1FAFF | // emoji 及符号
+        0x20000..=0x3FFFD   // CJK 扩展 B 及以上
+    );
+    if wide { 2 } else { 1 }
 }
 
 fn spacer(n: usize) -> String {
@@ -1646,4 +1673,43 @@ fn truncate_lines(s: &str, max: usize) -> String {
         r.push_str(" ...");
     }
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ascii_width_is_one_per_char() {
+        assert_eq!(visible_width("hello"), 5);
+        assert_eq!(visible_width(""), 0);
+    }
+
+    #[test]
+    fn cjk_chars_are_two_columns() {
+        assert_eq!(visible_width("中文"), 4);
+        assert_eq!(visible_width("a中b"), 4); // 1 + 2 + 1
+    }
+
+    #[test]
+    fn symbols_above_0x2000_stay_one_column() {
+        // 回归：旧逻辑 `c > 0x2000 即算 2 列` 会把这些误判成 2，导致表格列错位
+        assert_eq!(char_display_width('→'), 1); // U+2192 箭头
+        assert_eq!(char_display_width('•'), 1); // U+2022 项目符号
+        assert_eq!(char_display_width('│'), 1); // U+2502 表格边框
+        assert_eq!(char_display_width('—'), 1); // U+2014 破折号
+        assert_eq!(char_display_width('“'), 1); // U+201C 左引号
+    }
+
+    #[test]
+    fn fullwidth_and_emoji_are_two_columns() {
+        assert_eq!(char_display_width('，'), 2); // U+FF0C 全角逗号
+        assert_eq!(char_display_width('🦀'), 2); // emoji
+    }
+
+    #[test]
+    fn ansi_escapes_have_zero_width() {
+        let styled = format!("{}中{}", ColorTheme::BOLD, ColorTheme::RESET);
+        assert_eq!(visible_width(&styled), 2);
+    }
 }
