@@ -287,7 +287,7 @@ model = "gpt-4o"
 # API密钥 (也可通过 RAVEN_API_KEY 环境变量设置)
 # api_key = "sk-..."
 
-# API基础URL (使用第三方中转站时设置)
+# API基础URL (使用第三方 OpenAI 兼容端点时设置)
 # base_url = "https://api.openai.com/v1"
 
 [permission]

@@ -14,8 +14,8 @@ A sharp, cross-platform AI agent in Rust. Named after the raven — nature's mos
 | 特性 Feature | 说明 Description |
 |-------------|-----------------|
 | **轻量高效 Lightweight** | Rust 实现，Release 二进制 ~12MB，内存 ~12MB |
-| **多模型 Multi-model** | OpenAI / Anthropic / DeepSeek / 任意 OpenAI 兼容中转站 |
-| **提供商验证 Provider verification** | 连通性 + 功能测试 + SHA256 指纹，自动检测假中转站 |
+| **多模型 Multi-model** | OpenAI / Anthropic / DeepSeek / 任意 OpenAI 兼容端点 |
+| **提供商验证 Provider verification** | 连通性 + 功能测试 + SHA256 指纹，自动检测异常端点 |
 | **10 个内置工具 Built-in tools** | file_read/write/edit/view/shell/search/list_dir/git/web_search/fetch_url |
 | **Claude Code 工具** | FileEdit（diff 编辑）、View（代码查看）、成本追踪 |
 | **MCP 协议** | 连接外部 MCP Server，无限扩展工具 |
@@ -24,7 +24,7 @@ A sharp, cross-platform AI agent in Rust. Named after the raven — nature's mos
 | **会话持久化 Session persistence** | 自动保存对话历史，启动时可恢复 |
 | **7 个提示词模板 Prompt templates** | coder/reviewer/architect/debugger/rust_expert/writer/default |
 | **跨平台 Cross-platform** | Linux / macOS / Windows / Android (Termux) |
-| **5 个前端入口** | CLI + TUI + Web + VS Code 插件 + Tauri 桌面端 |
+| **前端入口** | CLI + TUI + Web + VS Code 插件（Tauri 桌面端开发中，暂不可用） |
 
 ## 快速开始 / Quick Start
 
@@ -92,6 +92,9 @@ npm run compile
 ```
 
 ### Tauri 桌面端 / Desktop
+
+> ⚠️ **暂不可用 / Currently unavailable**：桌面端为实验性脚手架，尚未达到可用状态，请使用 CLI / TUI / Web 入口。
+> The desktop app is an experimental scaffold and is not yet usable. Please use the CLI / TUI / Web entry points instead.
 
 ```bash
 cd desktop
@@ -161,7 +164,7 @@ raven --help           # 显示帮助
 
 ```bash
 export RAVEN_API_KEY="sk-..."           # API 密钥
-export RAVEN_BASE_URL="https://..."     # 中转站 URL
+export RAVEN_BASE_URL="https://..."     # API base_url（OpenAI 兼容端点）
 export RAVEN_MODEL="gpt-4o"             # 模型
 export RAVEN_LOG_LEVEL="info"           # 日志级别
 ```
