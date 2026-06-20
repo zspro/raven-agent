@@ -113,7 +113,79 @@ impl Tool for FileWriteTool {
 // ShellTool - Shell 执行
 // =============================================================================
 
-pub struct ShellTool;
+pub struct ShellTool {
+    /// 允许执行的命令白名单。为空时回退到内置安全默认集。
+    pub allowed: Vec<String>,
+    /// 命令超时（秒）
+    pub timeout: u64,
+}
+
+impl Default for ShellTool {
+    fn default() -> Self {
+        Self {
+            allowed: default_shell_allowed(),
+            timeout: 30,
+        }
+    }
+}
+
+impl ShellTool {
+    /// 用配置构造（白名单为空则使用内置默认集）
+    pub fn with_config(allowed: Vec<String>, timeout: u64) -> Self {
+        Self {
+            allowed: if allowed.is_empty() {
+                default_shell_allowed()
+            } else {
+                allowed
+            },
+            timeout: if timeout == 0 { 30 } else { timeout },
+        }
+    }
+}
+
+/// 内置安全默认命令集（按平台区分）
+fn default_shell_allowed() -> Vec<String> {
+    #[cfg(windows)]
+    let cmds = [
+        "dir", "type", "findstr", "where", "git", "go", "npm", "node",
+        "echo", "cd", "more", "tree", "curl", "python", "cargo",
+    ];
+    #[cfg(not(windows))]
+    let cmds = [
+        "ls", "cat", "grep", "find", "git", "go", "npm", "node", "echo",
+        "pwd", "head", "tail", "wc", "mkdir", "touch", "cp", "mv", "curl",
+    ];
+    cmds.iter().map(|s| s.to_string()).collect()
+}
+
+/// 危险命令黑名单：即使在白名单内也一律拒绝执行。
+/// 这是不可绕过的安全底线，防止破坏性操作。
+fn is_dangerous_command(command: &str) -> Option<&'static str> {
+    let lower = command.to_lowercase();
+    // 破坏性删除 / 磁盘操作 / 关机等
+    const PATTERNS: &[(&str, &str)] = &[
+        ("rm -rf", "递归强制删除"),
+        ("rm -fr", "递归强制删除"),
+        ("rmdir /s", "递归删除目录"),
+        ("del /f", "强制删除"),
+        ("del /s", "递归删除"),
+        ("format ", "格式化磁盘"),
+        ("mkfs", "格式化文件系统"),
+        ("dd ", "磁盘块写入"),
+        (":(){", "fork 炸弹"),
+        ("shutdown", "关机/重启"),
+        ("reboot", "重启"),
+        ("> /dev/sda", "覆写磁盘设备"),
+        ("chmod -r 777", "递归放开权限"),
+        ("mkfs.", "格式化文件系统"),
+    ];
+    for (pat, reason) in PATTERNS {
+        if lower.contains(pat) {
+            return Some(reason);
+        }
+    }
+    None
+}
 
 #[async_trait]
 impl Tool for ShellTool {
@@ -140,22 +212,24 @@ impl Tool for ShellTool {
 
     async fn execute(&self, args: serde_json::Value) -> Result<String, String> {
         let command = args["command"].as_str().ok_or("缺少 command 参数")?;
-        let timeout = args["timeout"].as_u64().unwrap_or(30);
+        let timeout = args["timeout"].as_u64().unwrap_or(self.timeout);
 
-        // 安全检查：仅放行只读 / 低风险命令。按平台区分。
-        #[cfg(windows)]
-        let allowed = [
-            "dir", "type", "findstr", "where", "git", "go", "npm", "node",
-            "echo", "cd", "more", "tree", "curl", "python", "cargo",
-        ];
-        #[cfg(not(windows))]
-        let allowed = [
-            "ls", "cat", "grep", "find", "git", "go", "npm", "node", "echo",
-            "pwd", "head", "tail", "wc", "mkdir", "touch", "cp", "mv", "curl",
-        ];
+        // 危险命令黑名单：不可绕过的安全底线
+        if let Some(reason) = is_dangerous_command(command) {
+            return Err(format!(
+                "已拒绝危险命令（{}）: '{}'\n此类破坏性操作被安全策略禁止，如确需执行请在终端手动运行。",
+                reason, command
+            ));
+        }
+
+        // 白名单检查：取首个 token 作为命令名
         let cmd = command.split_whitespace().next().unwrap_or("");
-        if !allowed.contains(&cmd) {
-            return Err(format!("命令 '{}' 不在允许列表中", cmd));
+        if !self.allowed.iter().any(|c| c == cmd) {
+            return Err(format!(
+                "命令 '{}' 不在允许列表中。\n可在配置 'tools.shell.allowed' 中添加，当前允许: {}",
+                cmd,
+                self.allowed.join(", ")
+            ));
         }
 
         let output = tokio::time::timeout(
@@ -443,4 +517,59 @@ fn format_size(bytes: u64) -> String {
     }
 
     format!("{:.1} {}", size, UNITS[unit_idx])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dangerous_command_detected() {
+        assert!(is_dangerous_command("rm -rf /").is_some());
+        assert!(is_dangerous_command("RM -RF ~/data").is_some()); // 大小写不敏感
+        assert!(is_dangerous_command("sudo shutdown now").is_some());
+        assert!(is_dangerous_command("mkfs.ext4 /dev/sdb").is_some());
+        assert!(is_dangerous_command("dd if=/dev/zero of=/dev/sda").is_some());
+    }
+
+    #[test]
+    fn test_safe_command_not_flagged() {
+        assert!(is_dangerous_command("ls -la").is_none());
+        assert!(is_dangerous_command("git status").is_none());
+        assert!(is_dangerous_command("cat file.txt").is_none());
+    }
+
+    #[test]
+    fn test_shell_with_config_empty_falls_back() {
+        let tool = ShellTool::with_config(Vec::new(), 0);
+        assert!(!tool.allowed.is_empty(), "空白名单应回退到默认集");
+        assert_eq!(tool.timeout, 30, "0 超时应回退到 30");
+    }
+
+    #[test]
+    fn test_shell_with_config_custom() {
+        let tool = ShellTool::with_config(vec!["ls".to_string(), "echo".to_string()], 60);
+        assert_eq!(tool.allowed.len(), 2);
+        assert_eq!(tool.timeout, 60);
+    }
+
+    #[tokio::test]
+    async fn test_shell_rejects_dangerous() {
+        let tool = ShellTool::default();
+        let res = tool
+            .execute(serde_json::json!({"command": "rm -rf /tmp/x"}))
+            .await;
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("危险命令"));
+    }
+
+    #[tokio::test]
+    async fn test_shell_rejects_not_in_whitelist() {
+        let tool = ShellTool::with_config(vec!["ls".to_string()], 30);
+        let res = tool
+            .execute(serde_json::json!({"command": "wget http://x"}))
+            .await;
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("不在允许列表"));
+    }
 }

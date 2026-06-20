@@ -37,14 +37,19 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// 创建注册表并注册所有内置工具
+    /// 创建注册表并注册所有内置工具（shell 使用安全默认白名单）
     pub fn new() -> Self {
+        Self::with_shell_config(Vec::new(), 30)
+    }
+
+    /// 用 shell 配置创建注册表（白名单为空则回退到内置安全默认集）
+    pub fn with_shell_config(shell_allowed: Vec<String>, shell_timeout: u64) -> Self {
         let mut map: HashMap<String, Box<dyn Tool>> = HashMap::new();
 
         let tools: Vec<Box<dyn Tool>> = vec![
             Box::new(FileReadTool),
             Box::new(FileWriteTool),
-            Box::new(ShellTool),
+            Box::new(ShellTool::with_config(shell_allowed, shell_timeout)),
             Box::new(SearchTool),
             Box::new(ListDirTool),
             Box::new(GitTool),
@@ -137,7 +142,7 @@ fn builtin_tool_by_name(name: &str) -> Box<dyn Tool> {
     match name {
         "file_read" => Box::new(FileReadTool),
         "file_write" => Box::new(FileWriteTool),
-        "shell" => Box::new(ShellTool),
+        "shell" => Box::new(ShellTool::default()),
         "search" => Box::new(SearchTool),
         "list_dir" => Box::new(ListDirTool),
         "git" => Box::new(GitTool),

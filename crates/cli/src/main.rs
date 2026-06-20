@@ -163,11 +163,14 @@ async fn init_agent() -> Arc<Agent> {
             std::process::exit(1);
         });
 
-    let agent = Agent::from_config(&cfg_sys).await
+    let mut agent = Agent::from_config(&cfg_sys).await
         .unwrap_or_else(|e| {
             eprintln!("初始化失败: {}", e);
             std::process::exit(1);
         });
+
+    // 注入终端确认器：ask 模式下执行敏感工具前实时询问 y/n/a
+    agent.set_confirmer(Arc::new(raven_core::StdinConfirmer));
 
     Arc::new(agent)
 }

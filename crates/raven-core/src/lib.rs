@@ -1,13 +1,21 @@
 //! # agent-core
 //! Agent 核心循环
 
+pub mod confirm;
+
+pub use confirm::{
+    describe_tool, AllowAllConfirmer, ConfirmRequest, Confirmer, Decision, DenyAllConfirmer,
+    StdinConfirmer,
+};
+
 use raven_types::*;
 use config_system::ConfigSystem;
 use context_engine::{ContextManager, ContextStats};
 use context_engine::cache::ResponseCache;
 use model_router::Router;
+use std::collections::HashSet;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock};
 use tool_system::Registry;
 use tool_system::git_first::GitFirst;
 use tracing::{debug, info, warn};
@@ -21,13 +29,29 @@ pub struct Agent {
     permission: PermissionChecker,
     cache: ResponseCache,
     git_first: GitFirst,
+    /// 交互式确认回调（由 UI 层注入）。为 None 时 `ask` 模式回退为"默认拒绝"。
+    confirmer: Option<Arc<dyn Confirmer>>,
+}
+
+/// 权限门控决定
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Gate {
+    /// 直接放行
+    Allow,
+    /// 直接拒绝，附原因
+    Deny(String),
+    /// 需要向用户实时确认
+    NeedConfirm,
 }
 
 /// 权限检查器
+#[derive(Clone)]
 struct PermissionChecker {
     mode: String,
     allowed: Vec<String>,
     denied: Vec<String>,
+    /// 本会话内"始终允许"的工具（用户选择 AllowAlways 后写入），避免反复打扰。
+    session_allow: Arc<RwLock<HashSet<String>>>,
 }
 
 /// 诊断结果
@@ -64,8 +88,11 @@ impl Agent {
             }
         }
 
-        // 创建工具注册表
-        let tools = Arc::new(Registry::new());
+        // 创建工具注册表（shell 白名单 / 超时来自配置）
+        let tools = Arc::new(Registry::with_shell_config(
+            cfg.tools.shell.allowed.clone(),
+            cfg.tools.shell.timeout,
+        ));
 
         // 创建上下文管理器
         let context = Arc::new(ContextManager::new(&cfg));
@@ -75,6 +102,7 @@ impl Agent {
             mode: cfg.permission.mode.clone(),
             allowed: cfg.permission.allowed_tools.clone(),
             denied: cfg.permission.denied_tools.clone(),
+            session_allow: Arc::new(RwLock::new(HashSet::new())),
         };
 
         // 创建响应缓存
@@ -93,6 +121,7 @@ impl Agent {
             permission,
             cache,
             git_first,
+            confirmer: None,
         })
     }
 
@@ -224,7 +253,8 @@ impl Agent {
         let router = self.router.clone();
         let tools = self.tools.clone();
         let context = self.context.clone();
-        let permission = self.permission.mode.clone();
+        let permission = self.permission.clone();
+        let confirmer = self.confirmer.clone();
         let model = self.config.model.clone();
 
         tokio::spawn(async move {
@@ -241,7 +271,7 @@ impl Agent {
                 }
 
                 // 获取工具
-                let tool_schemas = if permission == "readonly" {
+                let tool_schemas = if permission.mode == "readonly" {
                     Vec::new()
                 } else {
                     tools.list_schemas().await
@@ -309,7 +339,16 @@ impl Agent {
                 // 执行工具
                 let mut results = Vec::new();
                 for tc in &tool_calls {
-                    let result = tools.execute(tc).await;
+                    // 权限门控 + 交互式确认（与同步路径共用同一逻辑）
+                    let result = match Self::gate_and_confirm(&permission, confirmer.as_ref(), tc).await {
+                        Ok(()) => tools.execute(tc).await,
+                        Err(reason) => ToolResult {
+                            tool_call_id: tc.id.clone(),
+                            name: tc.function.name.clone(),
+                            content: reason,
+                            is_error: true,
+                        },
+                    };
                     results.push(result.clone());
 
                     if let Ok(json) = serde_json::to_string(&result) {
@@ -474,6 +513,14 @@ impl Agent {
         self.permission.mode = mode;
     }
 
+    /// 注入交互式确认回调（由 UI 层 CLI/TUI 提供）。
+    ///
+    /// 注入后，`ask` 模式下不在白名单的工具会触发实时确认；
+    /// 未注入时 `ask` 模式对这些工具回退为"默认拒绝"以保证安全。
+    pub fn set_confirmer(&mut self, confirmer: Arc<dyn Confirmer>) {
+        self.confirmer = Some(confirmer);
+    }
+
     /// 更新上下文配置
     pub fn set_context_config(&mut self, ctx: raven_types::ContextConfig) {
         self.config.context = ctx.clone();
@@ -504,14 +551,18 @@ impl Agent {
         let mut results = Vec::new();
 
         for call in calls {
-            if !self.permission.can_execute(&call.function.name) {
+            // 权限门控 + 交互式确认
+            if let Err(reason) = Self::gate_and_confirm(
+                &self.permission,
+                self.confirmer.as_ref(),
+                call,
+            )
+            .await
+            {
                 results.push(ToolResult {
                     tool_call_id: call.id.clone(),
                     name: call.function.name.clone(),
-                    content: format!(
-                        "权限不足: 工具 '{}' 未被授权\n修复: 在配置中 'permission.allowed_tools' 添加 '{}'",
-                        call.function.name, call.function.name
-                    ),
+                    content: reason,
                     is_error: true,
                 });
                 continue;
@@ -544,6 +595,47 @@ impl Agent {
 
         results
     }
+
+    /// 工具执行前的权限门控 + 交互式确认（CLI 同步路径与流式路径共用）。
+    ///
+    /// 返回 `Ok(())` 表示放行，`Err(reason)` 表示拒绝（reason 作为工具错误结果回传给模型）。
+    async fn gate_and_confirm(
+        permission: &PermissionChecker,
+        confirmer: Option<&Arc<dyn Confirmer>>,
+        call: &ToolCall,
+    ) -> Result<(), String> {
+        let tool = &call.function.name;
+        match permission.gate(tool).await {
+            Gate::Allow => Ok(()),
+            Gate::Deny(reason) => Err(reason),
+            Gate::NeedConfirm => {
+                let Some(confirmer) = confirmer else {
+                    // 无确认回调（如非交互场景）：默认拒绝，保证安全底线。
+                    return Err(format!(
+                        "需要确认但当前环境无法交互，已拒绝工具 '{tool}'\n\
+                         修复: 在交互终端中运行，或在配置 'permission.allowed_tools' 添加 '{tool}'，或切到 'yes' 模式。"
+                    ));
+                };
+                let args: serde_json::Value =
+                    serde_json::from_str(&call.function.arguments).unwrap_or_default();
+                let detail = confirm::describe_tool(tool, &args);
+                let req = ConfirmRequest {
+                    tool: tool.clone(),
+                    detail,
+                };
+                match confirmer.confirm(&req).await {
+                    Decision::Allow => Ok(()),
+                    Decision::AllowAlways => {
+                        permission.remember_allow(tool).await;
+                        Ok(())
+                    }
+                    Decision::Deny => {
+                        Err(format!("用户拒绝执行工具 '{tool}'"))
+                    }
+                }
+            }
+        }
+    }
 }
 
 // =============================================================================
@@ -551,20 +643,145 @@ impl Agent {
 // =============================================================================
 
 impl PermissionChecker {
-    fn can_execute(&self, tool_name: &str) -> bool {
-        if self.mode == "readonly" {
-            return false;
+    /// 三态权限门控。
+    ///
+    /// - `readonly`：写工具一律拒绝（schema 已不下发，这里再兜底）。
+    /// - `yes`：除显式 denied 外全部放行。
+    /// - `auto`：除 denied 外全部放行（与 yes 类似，但保留语义区分）。
+    /// - `ask`：denied → 拒绝；白名单或本会话已"始终允许" → 放行；其余 → 需确认。
+    async fn gate(&self, tool_name: &str) -> Gate {
+        let name = tool_name.to_string();
+
+        if self.denied.contains(&name) {
+            return Gate::Deny(format!(
+                "工具 '{tool_name}' 在 'permission.denied_tools' 黑名单中，已拒绝。"
+            ));
         }
-        if self.mode == "yes" {
-            return !self.denied.contains(&tool_name.to_string());
+
+        match self.mode.as_str() {
+            "readonly" => Gate::Deny(format!(
+                "只读模式（readonly）下不允许执行工具 '{tool_name}'。"
+            )),
+            "yes" | "auto" => Gate::Allow,
+            // ask 模式（默认）
+            _ => {
+                if self.allowed.contains(&name) {
+                    return Gate::Allow;
+                }
+                if self.session_allow.read().await.contains(&name) {
+                    return Gate::Allow;
+                }
+                Gate::NeedConfirm
+            }
         }
-        if self.denied.contains(&tool_name.to_string()) {
-            return false;
+    }
+
+    /// 记录"本会话始终允许"该工具（用户选择 AllowAlways 后）。
+    async fn remember_allow(&self, tool_name: &str) {
+        self.session_allow.write().await.insert(tool_name.to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn checker(mode: &str) -> PermissionChecker {
+        PermissionChecker {
+            mode: mode.to_string(),
+            allowed: vec!["file_read".to_string(), "search".to_string()],
+            denied: vec!["dangerous".to_string()],
+            session_allow: Arc::new(RwLock::new(HashSet::new())),
         }
-        if self.mode == "auto" {
-            return true;
-        }
-        // ask 模式
-        self.allowed.contains(&tool_name.to_string())
+    }
+
+    #[tokio::test]
+    async fn readonly_denies_everything() {
+        let c = checker("readonly");
+        assert!(matches!(c.gate("file_read").await, Gate::Deny(_)));
+        assert!(matches!(c.gate("shell").await, Gate::Deny(_)));
+    }
+
+    #[tokio::test]
+    async fn yes_mode_allows_except_denied() {
+        let c = checker("yes");
+        assert_eq!(c.gate("shell").await, Gate::Allow);
+        assert!(matches!(c.gate("dangerous").await, Gate::Deny(_)));
+    }
+
+    #[tokio::test]
+    async fn ask_allows_whitelist_confirms_others() {
+        let c = checker("ask");
+        // 白名单内静默放行
+        assert_eq!(c.gate("file_read").await, Gate::Allow);
+        // 黑名单直接拒绝
+        assert!(matches!(c.gate("dangerous").await, Gate::Deny(_)));
+        // 其余需确认
+        assert_eq!(c.gate("shell").await, Gate::NeedConfirm);
+    }
+
+    #[tokio::test]
+    async fn ask_remembers_allow_always() {
+        let c = checker("ask");
+        assert_eq!(c.gate("shell").await, Gate::NeedConfirm);
+        c.remember_allow("shell").await;
+        // AllowAlways 后本会话不再询问
+        assert_eq!(c.gate("shell").await, Gate::Allow);
+    }
+
+    #[tokio::test]
+    async fn gate_and_confirm_allow_all() {
+        let perm = checker("ask");
+        let confirmer: Arc<dyn Confirmer> = Arc::new(AllowAllConfirmer);
+        let call = ToolCall {
+            index: 0,
+            id: "1".to_string(),
+            call_type: "function".to_string(),
+            function: ToolCallFunction {
+                name: "shell".to_string(),
+                arguments: r#"{"command":"ls"}"#.to_string(),
+            },
+        };
+        assert!(Agent::gate_and_confirm(&perm, Some(&confirmer), &call).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn gate_and_confirm_deny_when_user_rejects() {
+        let perm = checker("ask");
+        let confirmer: Arc<dyn Confirmer> = Arc::new(DenyAllConfirmer);
+        let call = ToolCall {
+            index: 0,
+            id: "1".to_string(),
+            call_type: "function".to_string(),
+            function: ToolCallFunction {
+                name: "shell".to_string(),
+                arguments: r#"{"command":"ls"}"#.to_string(),
+            },
+        };
+        assert!(Agent::gate_and_confirm(&perm, Some(&confirmer), &call).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn gate_and_confirm_no_confirmer_denies() {
+        let perm = checker("ask");
+        let call = ToolCall {
+            index: 0,
+            id: "1".to_string(),
+            call_type: "function".to_string(),
+            function: ToolCallFunction {
+                name: "shell".to_string(),
+                arguments: r#"{"command":"ls"}"#.to_string(),
+            },
+        };
+        // 无确认回调（非交互场景）→ 默认拒绝
+        assert!(Agent::gate_and_confirm(&perm, None, &call).await.is_err());
+    }
+
+    #[test]
+    fn describe_tool_renders_summary() {
+        let args = serde_json::json!({"command": "rm file.txt"});
+        assert!(confirm::describe_tool("shell", &args).contains("rm file.txt"));
+        let args = serde_json::json!({"path": "a.txt", "append": false});
+        assert!(confirm::describe_tool("file_write", &args).contains("a.txt"));
     }
 }
