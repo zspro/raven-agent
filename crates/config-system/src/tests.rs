@@ -4,8 +4,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::{ConfigSystem, init_config};
-    use std::io::Write;
+    use crate::init_config;
 
     /// 场景：零配置启动（所有字段使用默认值）
     #[test]

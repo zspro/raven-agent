@@ -1,4 +1,4 @@
-//! agent-types 单元测试
+//! raven-types 单元测试
 //!
 //! 核心类型的序列化、反序列化和验证测试。
 
@@ -33,6 +33,15 @@ mod tests {
     }
 
     #[test]
+    fn test_message_tool_result() {
+        let msg = Message::tool_result("call_1", "file_read", "content");
+        assert_eq!(msg.role, Role::Tool);
+        assert_eq!(msg.content, "content");
+        assert_eq!(msg.tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(msg.name.as_deref(), Some("file_read"));
+    }
+
+    #[test]
     fn test_message_serialization() {
         let msg = Message::user("Test");
         let json = serde_json::to_string(&msg).unwrap();
@@ -42,7 +51,7 @@ mod tests {
 
     #[test]
     fn test_message_deserialization() {
-        let json = r#"{"role":"assistant","content":"Hello","tool_calls":null}"#;
+        let json = r#"{"role":"assistant","content":"Hello"}"#;
         let msg: Message = serde_json::from_str(json).unwrap();
         assert_eq!(msg.role, Role::Assistant);
         assert_eq!(msg.content, "Hello");
@@ -55,13 +64,35 @@ mod tests {
     #[test]
     fn test_tool_call() {
         let call = ToolCall {
+            index: 0,
             id: "call_123".to_string(),
-            function: FunctionCall {
+            call_type: "function".to_string(),
+            function: ToolCallFunction {
                 name: "file_read".to_string(),
-                arguments: serde_json::json!({"path": "test.txt"}),
+                arguments: r#"{"path":"test.txt"}"#.to_string(),
             },
         };
         assert_eq!(call.function.name, "file_read");
+        assert_eq!(call.id, "call_123");
+        assert_eq!(call.call_type, "function");
+    }
+
+    #[test]
+    fn test_tool_call_arguments_from_string() {
+        // OpenAI 标准格式: arguments 为 JSON 字符串
+        let json = r#"{"name":"shell","arguments":"{\"command\":\"ls\"}"}"#;
+        let f: ToolCallFunction = serde_json::from_str(json).unwrap();
+        assert_eq!(f.name, "shell");
+        assert_eq!(f.arguments, r#"{"command":"ls"}"#);
+    }
+
+    #[test]
+    fn test_tool_call_arguments_from_object() {
+        // NewAPI/OneAPI 代理格式: arguments 为 JSON 对象
+        let json = r#"{"name":"shell","arguments":{"command":"ls"}}"#;
+        let f: ToolCallFunction = serde_json::from_str(json).unwrap();
+        assert_eq!(f.name, "shell");
+        assert_eq!(f.arguments, r#"{"command":"ls"}"#);
     }
 
     #[test]
@@ -95,7 +126,7 @@ mod tests {
         let cfg = Config::default();
         assert_eq!(cfg.model, "gpt-4o");
         assert_eq!(cfg.permission.mode, "ask");
-        assert_eq!(cfg.context.max_tokens, 128000);
+        assert_eq!(cfg.context.max_tokens, 128_000);
         assert_eq!(cfg.context.keep_rounds, 6);
         assert_eq!(cfg.token_budget, 0);
         assert_eq!(cfg.log_level, "info");
@@ -151,6 +182,7 @@ mod tests {
         let err = AgentError::config("invalid key", "check your config");
         let msg = format!("{}", err);
         assert!(msg.contains("invalid key"));
+        assert!(msg.contains("check your config"));
     }
 
     #[test]
@@ -165,17 +197,23 @@ mod tests {
 
     #[test]
     fn test_error_permission() {
-        let err = AgentError::Permission {
-            message: "denied".to_string(),
-            fix: "allow tool".to_string(),
-        };
-        assert!(err.is_retryable());
+        let err = AgentError::permission("shell");
+        let msg = format!("{}", err);
+        assert!(msg.contains("shell"));
+    }
+
+    #[test]
+    fn test_error_budget() {
+        let err = AgentError::budget(100, 100);
+        let msg = format!("{}", err);
+        assert!(msg.contains("100"));
     }
 
     #[test]
     fn test_error_cancelled() {
         let err = AgentError::Cancelled;
-        assert!(!err.is_retryable());
+        let msg = format!("{}", err);
+        assert!(msg.contains("已取消"));
     }
 
     // ===================================================================
@@ -210,13 +248,30 @@ commit_prefix = "ai"
     #[test]
     fn test_token_usage() {
         let usage = TokenUsage {
-            input_tokens: 100,
-            output_tokens: 50,
-            total_tokens: 150,
+            input: 100,
+            output: 50,
+            total: 150,
+            cached: None,
         };
-        assert_eq!(usage.input_tokens, 100);
-        assert_eq!(usage.output_tokens, 50);
-        assert_eq!(usage.total_tokens, 150);
+        assert_eq!(usage.input, 100);
+        assert_eq!(usage.output, 50);
+        assert_eq!(usage.total, 150);
+        assert!(usage.cached.is_none());
+    }
+
+    #[test]
+    fn test_token_usage_serialization() {
+        // 字段通过 serde rename 输出为 input_tokens/output_tokens/total_tokens
+        let usage = TokenUsage {
+            input: 10,
+            output: 5,
+            total: 15,
+            cached: None,
+        };
+        let json = serde_json::to_string(&usage).unwrap();
+        assert!(json.contains("\"input_tokens\":10"));
+        assert!(json.contains("\"output_tokens\":5"));
+        assert!(json.contains("\"total_tokens\":15"));
     }
 
     // ===================================================================
@@ -247,12 +302,15 @@ models = ["deepseek-chat", "deepseek-coder"]
             tool_calls: vec![],
             model: "gpt-4o".to_string(),
             usage: TokenUsage {
-                input_tokens: 10,
-                output_tokens: 5,
-                total_tokens: 15,
+                input: 10,
+                output: 5,
+                total: 15,
+                cached: None,
             },
+            finish_reason: "stop".to_string(),
         };
         assert_eq!(resp.content, "Hello");
-        assert_eq!(resp.usage.total_tokens, 15);
+        assert_eq!(resp.usage.total, 15);
+        assert_eq!(resp.finish_reason, "stop");
     }
 }
