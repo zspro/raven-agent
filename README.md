@@ -259,4 +259,4 @@ web/index.html          Web UI
 
 ## License
 
-MIT
+Apache-2.0
