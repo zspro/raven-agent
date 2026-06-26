@@ -18,6 +18,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tool_system::git_first::GitFirst;
+use tool_system::mcp::McpManager;
 use tool_system::Registry;
 use tracing::{debug, info, warn};
 
@@ -34,6 +35,8 @@ pub struct Agent {
     confirmer: Option<Arc<dyn Confirmer>>,
     /// 崩溃恢复 checkpoint 管理器。创建失败时为 None，不阻断 Agent。
     checkpoint: Option<Arc<Mutex<CheckpointManager>>>,
+    /// MCP 工具管理器。无配置或全部连接失败时为 None。
+    mcp: Option<Arc<Mutex<McpManager>>>,
 }
 
 /// 权限门控决定
@@ -121,6 +124,25 @@ impl Agent {
             }
         };
 
+        // 连接 MCP Server（逐个连接，失败的跳过不阻断启动）
+        let mcp = if cfg.mcp_servers.is_empty() {
+            None
+        } else {
+            let mut manager = McpManager::new();
+            for server in &cfg.mcp_servers {
+                if let Err(e) = manager.add_server(server).await {
+                    warn!("MCP Server '{}' 连接失败，已跳过: {}", server.name, e);
+                }
+            }
+            if manager.connection_count() > 0 {
+                info!("MCP 已连接 {} 个 Server", manager.connection_count());
+                Some(Arc::new(Mutex::new(manager)))
+            } else {
+                warn!("所有 MCP Server 连接失败，MCP 不可用");
+                None
+            }
+        };
+
         info!("Agent 初始化完成，模型: {}", cfg.model);
 
         Ok(Self {
@@ -133,6 +155,7 @@ impl Agent {
             git_first,
             confirmer: None,
             checkpoint,
+            mcp,
         })
     }
 
@@ -170,6 +193,44 @@ impl Agent {
         if let Err(e) = mgr.clear() {
             debug!("清除 checkpoint 失败: {}", e);
         }
+    }
+
+    /// 收集全部可用工具 schema：内置工具 + 已连接的 MCP 工具。
+    /// readonly 模式由调用方判断是否调用本方法。
+    async fn collect_tool_schemas(&self) -> Vec<ToolSchema> {
+        let mut schemas = self.tools.list_schemas().await;
+        if let Some(mcp) = &self.mcp {
+            let mgr = mcp.lock().await;
+            schemas.extend(mgr.all_tool_schemas());
+        }
+        schemas
+    }
+
+    /// 执行单个工具调用，自动区分 MCP 工具（`server__tool`）与内置工具。
+    async fn dispatch_tool(&self, call: &ToolCall) -> ToolResult {
+        // MCP 工具名形如 `server__tool`，含 "__" 且非内置工具名
+        if let Some(mcp) = &self.mcp {
+            if call.function.name.contains("__") {
+                let args: serde_json::Value =
+                    serde_json::from_str(&call.function.arguments).unwrap_or_default();
+                let mut mgr = mcp.lock().await;
+                return match mgr.execute(&call.function.name, args).await {
+                    Ok(content) => ToolResult {
+                        tool_call_id: call.id.clone(),
+                        name: call.function.name.clone(),
+                        content,
+                        is_error: false,
+                    },
+                    Err(e) => ToolResult {
+                        tool_call_id: call.id.clone(),
+                        name: call.function.name.clone(),
+                        content: format!("MCP 工具执行失败: {}", e),
+                        is_error: true,
+                    },
+                };
+            }
+        }
+        self.tools.execute(call).await
     }
 
     /// 是否存在可恢复的未完成会话
@@ -262,11 +323,11 @@ impl Agent {
                 self.context.compact().await.map_err(AgentError::Internal)?;
             }
 
-            // 获取工具 schema（序列化为 JSON 值发送给 LLM）
+            // 获取工具 schema（内置 + MCP，序列化为 JSON 值发送给 LLM）
             let tool_schemas = if self.permission.mode == "readonly" {
                 Vec::new()
             } else {
-                self.tools.list_schemas().await
+                self.collect_tool_schemas().await
             };
 
             // 调用 LLM
@@ -340,6 +401,7 @@ impl Agent {
         let permission = self.permission.clone();
         let confirmer = self.confirmer.clone();
         let model = self.config.model.clone();
+        let mcp = self.mcp.clone();
 
         tokio::spawn(async move {
             loop {
@@ -354,11 +416,15 @@ impl Agent {
                     let _ = context.compact().await;
                 }
 
-                // 获取工具
+                // 获取工具（内置 + MCP）
                 let tool_schemas = if permission.mode == "readonly" {
                     Vec::new()
                 } else {
-                    tools.list_schemas().await
+                    let mut s = tools.list_schemas().await;
+                    if let Some(m) = &mcp {
+                        s.extend(m.lock().await.all_tool_schemas());
+                    }
+                    s
                 };
 
                 // 流式调用
@@ -432,7 +498,32 @@ impl Agent {
                     // 权限门控 + 交互式确认（与同步路径共用同一逻辑）
                     let result =
                         match Self::gate_and_confirm(&permission, confirmer.as_ref(), tc).await {
-                            Ok(()) => tools.execute(tc).await,
+                            Ok(()) => {
+                                // MCP 工具（server__tool）路由到 McpManager，其余走内置注册表
+                                if let Some(m) =
+                                    mcp.as_ref().filter(|_| tc.function.name.contains("__"))
+                                {
+                                    let args: serde_json::Value =
+                                        serde_json::from_str(&tc.function.arguments)
+                                            .unwrap_or_default();
+                                    match m.lock().await.execute(&tc.function.name, args).await {
+                                        Ok(content) => ToolResult {
+                                            tool_call_id: tc.id.clone(),
+                                            name: tc.function.name.clone(),
+                                            content,
+                                            is_error: false,
+                                        },
+                                        Err(e) => ToolResult {
+                                            tool_call_id: tc.id.clone(),
+                                            name: tc.function.name.clone(),
+                                            content: format!("MCP 工具执行失败: {}", e),
+                                            is_error: true,
+                                        },
+                                    }
+                                } else {
+                                    tools.execute(tc).await
+                                }
+                            }
                             Err(reason) => ToolResult {
                                 tool_call_id: tc.id.clone(),
                                 name: tc.function.name.clone(),
@@ -672,7 +763,7 @@ impl Agent {
                 None
             };
 
-            let result = self.tools.execute(call).await;
+            let result = self.dispatch_tool(call).await;
 
             // Git-first: 编辑后自动 commit
             if is_file_edit && !result.is_error {

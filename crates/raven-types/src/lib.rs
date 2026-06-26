@@ -370,6 +370,8 @@ pub struct Config {
     pub server: ServerConfig,
     #[serde(default)]
     pub git_first: GitFirstConfig,
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerConfig>,
 }
 
 impl Default for Config {
@@ -386,6 +388,7 @@ impl Default for Config {
             providers: Vec::new(),
             server: ServerConfig::default(),
             git_first: GitFirstConfig::default(),
+            mcp_servers: Vec::new(),
         }
     }
 }
@@ -613,6 +616,21 @@ fn default_git_first_auto() -> bool {
 
 fn default_git_first_prefix() -> String {
     "raven".to_string()
+}
+
+/// MCP Server 配置（外部 Model Context Protocol 服务，通过 stdio 通信）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    /// Server 名称（作为工具前缀：`<name>__<tool>`）
+    pub name: String,
+    /// 启动命令（如 npx）
+    pub command: String,
+    /// 命令参数
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// 额外环境变量
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<std::collections::HashMap<String, String>>,
 }
 
 // =============================================================================

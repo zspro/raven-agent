@@ -8,10 +8,9 @@
 //! 2. 在配置中添加 [[mcp_servers]]
 //! 3. Agent 自动发现并调用 MCP 工具
 
-use raven_types::{FunctionSchema, ToolSchema};
+use raven_types::{FunctionSchema, McpServerConfig, ToolSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -27,15 +26,6 @@ pub struct McpTool {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
-}
-
-/// MCP Server 配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct McpServerConfig {
-    pub name: String,
-    pub command: String,
-    pub args: Vec<String>,
-    pub env: Option<HashMap<String, String>>,
 }
 
 /// MCP 请求
