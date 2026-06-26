@@ -1,13 +1,15 @@
 //! CLI 入口
 
-use raven_core::Agent;
 use clap::{Parser, Subcommand};
+use raven_core::Agent;
 use std::io::{IsTerminal, Read};
 use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(name = "raven")]
-#[command(about = "Raven 🐦‍⬛ — Think like a raven. Code like the wind. 轻量跨平台 AI Agent 终端助手。")]
+#[command(
+    about = "Raven 🐦‍⬛ — Think like a raven. Code like the wind. 轻量跨平台 AI Agent 终端助手。"
+)]
 #[command(version = "0.1.0")]
 struct Cli {
     #[command(subcommand)]
@@ -157,22 +159,48 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
 
 /// 初始化 Agent
 async fn init_agent() -> Arc<Agent> {
-    let cfg_sys = config_system::ConfigSystem::load()
-        .unwrap_or_else(|e| {
-            eprintln!("配置错误: {}", e);
-            std::process::exit(1);
-        });
+    let cfg_sys = config_system::ConfigSystem::load().unwrap_or_else(|e| {
+        eprintln!("配置错误: {}", e);
+        std::process::exit(1);
+    });
 
-    let mut agent = Agent::from_config(&cfg_sys).await
-        .unwrap_or_else(|e| {
-            eprintln!("初始化失败: {}", e);
-            std::process::exit(1);
-        });
+    let mut agent = Agent::from_config(&cfg_sys).await.unwrap_or_else(|e| {
+        eprintln!("初始化失败: {}", e);
+        std::process::exit(1);
+    });
 
     // 注入终端确认器：ask 模式下执行敏感工具前实时询问 y/n/a
     agent.set_confirmer(Arc::new(raven_core::StdinConfirmer));
 
     Arc::new(agent)
+}
+
+/// 启动时检查是否有未完成的会话 checkpoint，交互式询问用户是否恢复。
+/// 非 TTY 环境直接跳过（不阻塞管道/CI）。
+async fn maybe_recover(agent: &Arc<Agent>) {
+    use std::io::{IsTerminal, Write};
+
+    if !std::io::stdin().is_terminal() {
+        return;
+    }
+    if !agent.has_recoverable().await {
+        return;
+    }
+
+    print!("\x1b[33m发现上次未完成的会话，是否恢复？[Y/n] \x1b[0m");
+    let _ = std::io::stdout().flush();
+
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return;
+    }
+    let ans = line.trim().to_lowercase();
+    if ans.is_empty() || ans == "y" || ans == "yes" {
+        let n = agent.recover_checkpoint().await;
+        println!("\x1b[2m已恢复 {} 条历史消息。\x1b[0m\n", n);
+    } else {
+        println!("\x1b[2m已跳过恢复，开始新会话。\x1b[0m\n");
+    }
 }
 
 /// 交互式对话
@@ -187,6 +215,9 @@ async fn cmd_chat_with_opening(opening: String) {
     // 青色加粗标题 + 暗色命令提示，避免宽字符撑破对齐的方框
     println!("\n  \x1b[1;36mRaven 🐦‍⬛\x1b[0m  \x1b[2m交互式对话\x1b[0m");
     println!("  \x1b[2m/quit 退出 · /clear 清空 · /compact 压缩 · /stats 统计 · /settings 设置 · /prompt 切换角色\x1b[0m\n");
+
+    // 崩溃恢复：发现上次未完成的会话时，询问是否恢复
+    maybe_recover(&agent).await;
 
     use std::io::Write;
 
@@ -239,8 +270,14 @@ async fn cmd_chat_with_opening(opening: String) {
                     }
                     "/stats" => {
                         let stats = agent.stats().await;
-                        println!("上下文: {} tokens ({} 消息)", stats.current_context_tokens, stats.message_count);
-                        println!("总使用: {} in + {} out = {} tokens", stats.total_input_tokens, stats.total_output_tokens, stats.total_tokens);
+                        println!(
+                            "上下文: {} tokens ({} 消息)",
+                            stats.current_context_tokens, stats.message_count
+                        );
+                        println!(
+                            "总使用: {} in + {} out = {} tokens",
+                            stats.total_input_tokens, stats.total_output_tokens, stats.total_tokens
+                        );
                         println!("预算: {}", stats.budget_status);
                         continue;
                     }
@@ -395,11 +432,18 @@ async fn cmd_verify() {
 
         let status = if v.verified { "✓" } else { "✗" };
         let mut features = Vec::new();
-        if v.features.streaming { features.push("stream"); }
-        if v.features.tool_calling { features.push("tools"); }
-        if v.features.vision { features.push("vision"); }
+        if v.features.streaming {
+            features.push("stream");
+        }
+        if v.features.tool_calling {
+            features.push("tools");
+        }
+        if v.features.vision {
+            features.push("vision");
+        }
 
-        println!("  {} {:15} {:5}ms  {} models  [{}]",
+        println!(
+            "  {} {:15} {:5}ms  {} models  [{}]",
             status,
             v.provider,
             v.latency_ms,
@@ -450,10 +494,20 @@ async fn cmd_settings(agent: &raven_core::Agent) {
         .unwrap_or_else(|| std::path::PathBuf::from("config.toml"));
 
     loop {
-        let api_key_display = cfg.api_key.as_ref()
-            .map(|k| format!("{}...{}", &k[..4.min(k.len())], &k[k.len().saturating_sub(4)..]))
+        let api_key_display = cfg
+            .api_key
+            .as_ref()
+            .map(|k| {
+                format!(
+                    "{}...{}",
+                    &k[..4.min(k.len())],
+                    &k[k.len().saturating_sub(4)..]
+                )
+            })
             .unwrap_or_else(|| "未设置".to_string());
-        let base_url_display = cfg.base_url.as_ref()
+        let base_url_display = cfg
+            .base_url
+            .as_ref()
             .map(|u| truncate_24(u))
             .unwrap_or_else(|| "默认 (OpenAI)".to_string());
 
@@ -467,16 +521,30 @@ async fn cmd_settings(agent: &raven_core::Agent) {
         println!("║                                        ║");
         println!("║  [安全]                                ║");
         println!("║  4. 权限模式: {:24} ║", truncate_24(&cfg.permission.mode));
-        println!("║  5. 允许工具: {:24} ║", truncate_24(&cfg.permission.allowed_tools.join(", ")));
+        println!(
+            "║  5. 允许工具: {:24} ║",
+            truncate_24(&cfg.permission.allowed_tools.join(", "))
+        );
         println!("║                                        ║");
         println!("║  [上下文]                              ║");
         println!("║  6. 上下文上限: {:22} ║", cfg.context.max_tokens);
         println!("║  7. 压缩阈值: {:24} ║", cfg.context.compact_threshold);
         println!("║  8. 保留轮数: {:24} ║", cfg.context.keep_rounds);
-        println!("║  9. Token预算: {:23} ║", if cfg.token_budget == 0 { "无限制".to_string() } else { cfg.token_budget.to_string() });
+        println!(
+            "║  9. Token预算: {:23} ║",
+            if cfg.token_budget == 0 {
+                "无限制".to_string()
+            } else {
+                cfg.token_budget.to_string()
+            }
+        );
         println!("║                                        ║");
         let git_first_status = if cfg.git_first.enabled {
-            if cfg.git_first.auto_commit { "开启(自动)" } else { "开启(手动)" }
+            if cfg.git_first.auto_commit {
+                "开启(自动)"
+            } else {
+                "开启(手动)"
+            }
         } else {
             "关闭"
         };
@@ -580,15 +648,31 @@ async fn cmd_settings(agent: &raven_core::Agent) {
             }
             "5" => {
                 println!("可用工具: file_read, file_write, shell, search, list_dir, git");
-                print!("输入允许的工具，逗号分隔 (当前: {}): ", cfg.permission.allowed_tools.join(", "));
+                print!(
+                    "输入允许的工具，逗号分隔 (当前: {}): ",
+                    cfg.permission.allowed_tools.join(", ")
+                );
                 std::io::stdout().flush().unwrap();
                 let mut val = String::new();
                 if std::io::stdin().read_line(&mut val).is_ok() {
                     let val = val.trim();
                     if !val.is_empty() {
-                        let tools: Vec<&str> = val.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-                        let formatted = tools.iter().map(|s| format!("\"{}\"", s)).collect::<Vec<_>>().join(", ");
-                        save_config_section(&config_path, "permission", "allowed_tools", &format!("[{}]", formatted));
+                        let tools: Vec<&str> = val
+                            .split(',')
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        let formatted = tools
+                            .iter()
+                            .map(|s| format!("\"{}\"", s))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        save_config_section(
+                            &config_path,
+                            "permission",
+                            "allowed_tools",
+                            &format!("[{}]", formatted),
+                        );
                         println!("✓ 工具列表已保存，重启后生效");
                     }
                 }
@@ -602,7 +686,12 @@ async fn cmd_settings(agent: &raven_core::Agent) {
                     let val = val.trim();
                     if let Ok(n) = val.parse::<usize>() {
                         if n >= 4096 {
-                            save_config_section(&config_path, "context", "max_tokens", &n.to_string());
+                            save_config_section(
+                                &config_path,
+                                "context",
+                                "max_tokens",
+                                &n.to_string(),
+                            );
                             println!("✓ 已保存，重启后生效");
                         } else {
                             println!("✗ 值太小，必须 >= 4096");
@@ -619,7 +708,12 @@ async fn cmd_settings(agent: &raven_core::Agent) {
                 if std::io::stdin().read_line(&mut val).is_ok() {
                     let val = val.trim();
                     if let Ok(n) = val.parse::<usize>() {
-                        save_config_section(&config_path, "context", "compact_threshold", &n.to_string());
+                        save_config_section(
+                            &config_path,
+                            "context",
+                            "compact_threshold",
+                            &n.to_string(),
+                        );
                         println!("✓ 已保存，重启后生效");
                     } else if !val.is_empty() {
                         println!("✗ 无效的数字");
@@ -676,7 +770,18 @@ async fn cmd_settings(agent: &raven_core::Agent) {
             }
             "12" => {
                 println!("\nGit-first 设计: 每次编辑文件后自动执行 git add + git commit");
-                println!("当前状态: {}", if cfg.git_first.enabled { if cfg.git_first.auto_commit { "开启（自动提交）" } else { "开启（手动提交）" } } else { "关闭" });
+                println!(
+                    "当前状态: {}",
+                    if cfg.git_first.enabled {
+                        if cfg.git_first.auto_commit {
+                            "开启（自动提交）"
+                        } else {
+                            "开启（手动提交）"
+                        }
+                    } else {
+                        "关闭"
+                    }
+                );
                 println!("\n选项:");
                 println!("  1. 开启 + 自动提交");
                 println!("  2. 开启 + 手动提交（只 add，不自动 commit）");
@@ -705,12 +810,10 @@ async fn cmd_settings(agent: &raven_core::Agent) {
                     }
                 }
             }
-            "s" | "S" => {
-                match save_full_config(&config_path, &cfg) {
-                    Ok(_) => println!("✓ 配置已保存到: {}", config_path.display()),
-                    Err(e) => println!("✗ 保存失败: {}", e),
-                }
-            }
+            "s" | "S" => match save_full_config(&config_path, &cfg) {
+                Ok(_) => println!("✓ 配置已保存到: {}", config_path.display()),
+                Err(e) => println!("✗ 保存失败: {}", e),
+            },
             "d" | "D" => {
                 let results = agent.doctor();
                 println!("\n诊断结果:");
@@ -759,14 +862,18 @@ fn manage_providers(config_path: &std::path::Path, cfg: &raven_types::Config) {
                 let mut name = String::new();
                 std::io::stdin().read_line(&mut name).unwrap();
                 let name = name.trim();
-                if name.is_empty() { continue; }
+                if name.is_empty() {
+                    continue;
+                }
 
                 print!("Base URL (如 https://api.deepseek.com/v1): ");
                 std::io::stdout().flush().unwrap();
                 let mut url = String::new();
                 std::io::stdin().read_line(&mut url).unwrap();
                 let url = url.trim();
-                if url.is_empty() { continue; }
+                if url.is_empty() {
+                    continue;
+                }
 
                 print!("API Key: ");
                 std::io::stdout().flush().unwrap();
@@ -778,22 +885,37 @@ fn manage_providers(config_path: &std::path::Path, cfg: &raven_types::Config) {
                 std::io::stdout().flush().unwrap();
                 let mut models = String::new();
                 std::io::stdin().read_line(&mut models).unwrap();
-                let models_list: Vec<String> = models.trim().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                let models_list: Vec<String> = models
+                    .trim()
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
 
                 // 追加到配置文件
-                let provider_toml = format!(r#"
+                let provider_toml = format!(
+                    r#"
 [[providers]]
 name = "{}"
 base_url = "{}"
 api_key = "{}"
 models = [{}]
 "#,
-                    name, url, key,
-                    models_list.iter().map(|m| format!("\"{}\"", m)).collect::<Vec<_>>().join(", ")
+                    name,
+                    url,
+                    key,
+                    models_list
+                        .iter()
+                        .map(|m| format!("\"{}\"", m))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
 
                 let content = std::fs::read_to_string(config_path).unwrap_or_default();
-                let _ = std::fs::write(config_path, format!("{}\n{}", content.trim_end(), provider_toml));
+                let _ = std::fs::write(
+                    config_path,
+                    format!("{}\n{}", content.trim_end(), provider_toml),
+                );
                 println!("✓ 提供商 '{}' 已添加，重启后生效", name);
             }
             "d" | "D" => {
@@ -809,7 +931,10 @@ models = [{}]
                     if n > 0 && n <= cfg.providers.len() {
                         println!("删除提供商 '{}'，重启后生效", cfg.providers[n - 1].name);
                         // 注：简单实现是让用户手动编辑文件
-                        println!("(请手动编辑 {} 删除对应 [[providers]] 段)", config_path.display());
+                        println!(
+                            "(请手动编辑 {} 删除对应 [[providers]] 段)",
+                            config_path.display()
+                        );
                     }
                 }
             }
@@ -877,7 +1002,12 @@ fn save_config_section(path: &std::path::Path, section: &str, key: &str, value: 
             let before = &content[..abs_key_pos];
             let after_key = &content[abs_key_pos..];
             if let Some(nl) = after_key.find('\n') {
-                format!("{}{}\n{}", before, new_line, &content[abs_key_pos + nl + 1..])
+                format!(
+                    "{}{}\n{}",
+                    before,
+                    new_line,
+                    &content[abs_key_pos + nl + 1..]
+                )
             } else {
                 format!("{}{}", before, new_line)
             }
@@ -898,11 +1028,9 @@ fn save_config_section(path: &std::path::Path, section: &str, key: &str, value: 
 
 /// 保存完整配置
 fn save_full_config(path: &std::path::Path, cfg: &raven_types::Config) -> Result<(), String> {
-    let content = toml::to_string_pretty(cfg)
-        .map_err(|e| format!("序列化失败: {}", e))?;
+    let content = toml::to_string_pretty(cfg).map_err(|e| format!("序列化失败: {}", e))?;
     std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new(".")))
         .map_err(|e| format!("创建目录失败: {}", e))?;
-    std::fs::write(path, content)
-        .map_err(|e| format!("写入失败: {}", e))?;
+    std::fs::write(path, content).map_err(|e| format!("写入失败: {}", e))?;
     Ok(())
 }

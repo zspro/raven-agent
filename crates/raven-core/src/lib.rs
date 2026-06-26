@@ -8,16 +8,17 @@ pub use confirm::{
     StdinConfirmer,
 };
 
-use raven_types::*;
 use config_system::ConfigSystem;
-use context_engine::{ContextManager, ContextStats};
 use context_engine::cache::ResponseCache;
+use context_engine::checkpoint::CheckpointManager;
+use context_engine::{ContextManager, ContextStats};
 use model_router::Router;
+use raven_types::*;
 use std::collections::HashSet;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
-use tool_system::Registry;
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tool_system::git_first::GitFirst;
+use tool_system::Registry;
 use tracing::{debug, info, warn};
 
 /// Agent 实例
@@ -31,6 +32,8 @@ pub struct Agent {
     git_first: GitFirst,
     /// 交互式确认回调（由 UI 层注入）。为 None 时 `ask` 模式回退为"默认拒绝"。
     confirmer: Option<Arc<dyn Confirmer>>,
+    /// 崩溃恢复 checkpoint 管理器。创建失败时为 None，不阻断 Agent。
+    checkpoint: Option<Arc<Mutex<CheckpointManager>>>,
 }
 
 /// 权限门控决定
@@ -74,11 +77,9 @@ impl Agent {
 
         // 注册默认提供商
         if cfg.api_key.is_some() {
-            router.register_default(
-                cfg.api_key.clone(),
-                cfg.base_url.clone(),
-                cfg.model.clone(),
-            ).await?;
+            router
+                .register_default(cfg.api_key.clone(), cfg.base_url.clone(), cfg.model.clone())
+                .await?;
         }
 
         // 注册额外提供商
@@ -111,6 +112,15 @@ impl Agent {
         // 创建 Git-first 管理器
         let git_first = GitFirst::new(cfg.git_first.enabled);
 
+        // 创建崩溃恢复 checkpoint 管理器（失败不阻断启动）
+        let checkpoint = match CheckpointManager::default() {
+            Ok(cm) => Some(Arc::new(Mutex::new(cm))),
+            Err(e) => {
+                warn!("Checkpoint 系统初始化失败，崩溃恢复不可用: {}", e);
+                None
+            }
+        };
+
         info!("Agent 初始化完成，模型: {}", cfg.model);
 
         Ok(Self {
@@ -122,12 +132,68 @@ impl Agent {
             cache,
             git_first,
             confirmer: None,
+            checkpoint,
         })
     }
 
     /// 设置系统提示词
     pub async fn set_system_prompt(&self, prompt: impl Into<String>) {
         self.context.set_system_prompt(prompt).await;
+    }
+
+    /// 写入崩溃恢复 checkpoint（每轮对话后调用，失败仅记日志不阻断）
+    async fn write_checkpoint(&self) {
+        let Some(cp) = &self.checkpoint else { return };
+        let messages = self.context.messages().await;
+        let stats = self.context.stats().await;
+        let session_id = self
+            .context
+            .current_session_id()
+            .await
+            .unwrap_or_else(|| "default".to_string());
+        let mut mgr = cp.lock().await;
+        if let Err(e) = mgr.write(
+            &session_id,
+            &messages,
+            None,
+            stats.total_input_tokens,
+            stats.total_output_tokens,
+        ) {
+            warn!("写入 checkpoint 失败: {}", e);
+        }
+    }
+
+    /// 清除崩溃恢复 checkpoint（会话正常结束后调用）
+    async fn clear_checkpoint(&self) {
+        let Some(cp) = &self.checkpoint else { return };
+        let mgr = cp.lock().await;
+        if let Err(e) = mgr.clear() {
+            debug!("清除 checkpoint 失败: {}", e);
+        }
+    }
+
+    /// 是否存在可恢复的未完成会话
+    pub async fn has_recoverable(&self) -> bool {
+        match &self.checkpoint {
+            Some(cp) => cp.lock().await.recover().is_some(),
+            None => false,
+        }
+    }
+
+    /// 从 checkpoint 恢复上次未完成的会话。
+    /// 成功返回恢复的消息条数；无 checkpoint 时返回 0。
+    pub async fn recover_checkpoint(&self) -> usize {
+        let Some(cp) = &self.checkpoint else { return 0 };
+        let recovered = { cp.lock().await.recover() };
+        match recovered {
+            Some(checkpoint) => {
+                let n = checkpoint.messages.len();
+                self.context.restore_messages(checkpoint.messages).await;
+                info!("已从 checkpoint #{} 恢复 {} 条消息", checkpoint.seq, n);
+                n
+            }
+            None => 0,
+        }
     }
 
     /// 使用模板设置系统提示词
@@ -177,7 +243,9 @@ impl Agent {
         if let Some(cached) = self.cache.get(&cache_key).await {
             debug!("缓存命中，跳过 API 调用");
             self.context.add_user_message(input).await;
-            self.context.add_assistant_message(&cached.content, Vec::new()).await;
+            self.context
+                .add_assistant_message(&cached.content, Vec::new())
+                .await;
             self.context.record_usage(&cached.usage);
             return Ok(cached.content);
         }
@@ -187,11 +255,11 @@ impl Agent {
 
         loop {
             // 检查预算
-            self.context.check_budget().map_err(|e| e)?;
+            self.context.check_budget()?;
 
             // 压缩上下文
             if self.context.should_compact().await {
-                self.context.compact().await.map_err(|e| AgentError::Internal(e))?;
+                self.context.compact().await.map_err(AgentError::Internal)?;
             }
 
             // 获取工具 schema（序列化为 JSON 值发送给 LLM）
@@ -204,9 +272,13 @@ impl Agent {
             // 调用 LLM
             let messages = self.context.messages().await;
             let resp = if tool_schemas.is_empty() {
-                self.router.chat(&self.config.model, &messages, None).await?
+                self.router
+                    .chat(&self.config.model, &messages, None)
+                    .await?
             } else {
-                self.router.chat(&self.config.model, &messages, Some(&tool_schemas)).await?
+                self.router
+                    .chat(&self.config.model, &messages, Some(&tool_schemas))
+                    .await?
             };
 
             // 记录使用
@@ -215,7 +287,9 @@ impl Agent {
             // 处理工具调用
             if !resp.tool_calls.is_empty() {
                 // 添加助手消息
-                self.context.add_assistant_message(&resp.content, resp.tool_calls.clone()).await;
+                self.context
+                    .add_assistant_message(&resp.content, resp.tool_calls.clone())
+                    .await;
 
                 // 执行工具
                 let results = self.execute_tools(&resp.tool_calls).await;
@@ -223,19 +297,29 @@ impl Agent {
                 // 添加结果
                 self.context.add_tool_results(results).await;
 
+                // 工具执行后写 checkpoint（崩溃风险点，便于恢复）
+                self.write_checkpoint().await;
+
                 continue; // 继续循环
             }
 
             // 没有工具调用，返回结果
-            self.context.add_assistant_message(&resp.content, Vec::new()).await;
+            self.context
+                .add_assistant_message(&resp.content, Vec::new())
+                .await;
             // 存入缓存
             self.cache.put(cache_key, &resp).await;
+            // 会话正常完成，清除 checkpoint
+            self.clear_checkpoint().await;
             return Ok(resp.content);
         }
     }
 
     /// 流式运行对话
-    pub async fn run_stream(&self, user_input: impl Into<String>) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
+    pub async fn run_stream(
+        &self,
+        user_input: impl Into<String>,
+    ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
         let input = user_input.into();
         let models = self.router.list_models().await;
 
@@ -282,7 +366,9 @@ impl Agent {
                 let stream_result = if tool_schemas.is_empty() {
                     router.chat_stream(&model, &messages, None).await
                 } else {
-                    router.chat_stream(&model, &messages, Some(&tool_schemas)).await
+                    router
+                        .chat_stream(&model, &messages, Some(&tool_schemas))
+                        .await
                 };
                 let mut stream = match stream_result {
                     Ok(s) => s,
@@ -328,27 +414,32 @@ impl Agent {
 
                 // 没有工具调用，结束
                 if tool_calls.is_empty() {
-                    context.add_assistant_message(&assistant_text, Vec::new()).await;
+                    context
+                        .add_assistant_message(&assistant_text, Vec::new())
+                        .await;
                     let _ = tx.send(StreamEvent::done()).await;
                     return;
                 }
 
                 // 有工具调用
-                context.add_assistant_message(&assistant_text, tool_calls.clone()).await;
+                context
+                    .add_assistant_message(&assistant_text, tool_calls.clone())
+                    .await;
 
                 // 执行工具
                 let mut results = Vec::new();
                 for tc in &tool_calls {
                     // 权限门控 + 交互式确认（与同步路径共用同一逻辑）
-                    let result = match Self::gate_and_confirm(&permission, confirmer.as_ref(), tc).await {
-                        Ok(()) => tools.execute(tc).await,
-                        Err(reason) => ToolResult {
-                            tool_call_id: tc.id.clone(),
-                            name: tc.function.name.clone(),
-                            content: reason,
-                            is_error: true,
-                        },
-                    };
+                    let result =
+                        match Self::gate_and_confirm(&permission, confirmer.as_ref(), tc).await {
+                            Ok(()) => tools.execute(tc).await,
+                            Err(reason) => ToolResult {
+                                tool_call_id: tc.id.clone(),
+                                name: tc.function.name.clone(),
+                                content: reason,
+                                is_error: true,
+                            },
+                        };
                     results.push(result.clone());
 
                     if let Ok(json) = serde_json::to_string(&result) {
@@ -454,7 +545,12 @@ impl Agent {
         };
         results.push(DoctorResult {
             check: "Git-first".to_string(),
-            status: if self.config.git_first.enabled { "ok" } else { "info" }.to_string(),
+            status: if self.config.git_first.enabled {
+                "ok"
+            } else {
+                "info"
+            }
+            .to_string(),
             message: gf_status.to_string(),
             fix: None,
         });
@@ -552,12 +648,8 @@ impl Agent {
 
         for call in calls {
             // 权限门控 + 交互式确认
-            if let Err(reason) = Self::gate_and_confirm(
-                &self.permission,
-                self.confirmer.as_ref(),
-                call,
-            )
-            .await
+            if let Err(reason) =
+                Self::gate_and_confirm(&self.permission, self.confirmer.as_ref(), call).await
             {
                 results.push(ToolResult {
                     tool_call_id: call.id.clone(),
@@ -569,8 +661,10 @@ impl Agent {
             }
 
             // Git-first: 编辑前保存状态
-            let is_file_edit = call.function.name == "file_edit" || call.function.name == "file_write";
-            let args_json: serde_json::Value = serde_json::from_str(&call.function.arguments).unwrap_or_default();
+            let is_file_edit =
+                call.function.name == "file_edit" || call.function.name == "file_write";
+            let args_json: serde_json::Value =
+                serde_json::from_str(&call.function.arguments).unwrap_or_default();
             let target_path = args_json.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let _before_hash = if is_file_edit {
                 self.git_first.pre_edit(target_path).unwrap_or(None)
@@ -587,7 +681,9 @@ impl Agent {
                 } else {
                     result.content.clone()
                 };
-                let _ = self.git_first.post_edit(target_path, &call.function.name, &desc);
+                let _ = self
+                    .git_first
+                    .post_edit(target_path, &call.function.name, &desc);
             }
 
             results.push(result);
@@ -629,9 +725,7 @@ impl Agent {
                         permission.remember_allow(tool).await;
                         Ok(())
                     }
-                    Decision::Deny => {
-                        Err(format!("用户拒绝执行工具 '{tool}'"))
-                    }
+                    Decision::Deny => Err(format!("用户拒绝执行工具 '{tool}'")),
                 }
             }
         }
@@ -678,7 +772,10 @@ impl PermissionChecker {
 
     /// 记录"本会话始终允许"该工具（用户选择 AllowAlways 后）。
     async fn remember_allow(&self, tool_name: &str) {
-        self.session_allow.write().await.insert(tool_name.to_string());
+        self.session_allow
+            .write()
+            .await
+            .insert(tool_name.to_string());
     }
 }
 
@@ -742,7 +839,9 @@ mod tests {
                 arguments: r#"{"command":"ls"}"#.to_string(),
             },
         };
-        assert!(Agent::gate_and_confirm(&perm, Some(&confirmer), &call).await.is_ok());
+        assert!(Agent::gate_and_confirm(&perm, Some(&confirmer), &call)
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
@@ -758,7 +857,9 @@ mod tests {
                 arguments: r#"{"command":"ls"}"#.to_string(),
             },
         };
-        assert!(Agent::gate_and_confirm(&perm, Some(&confirmer), &call).await.is_err());
+        assert!(Agent::gate_and_confirm(&perm, Some(&confirmer), &call)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

@@ -2,8 +2,8 @@
 //! 上下文管理和 Token 预算
 
 pub mod cache;
-pub mod session;
 pub mod checkpoint;
+pub mod session;
 
 use raven_types::{Config, ContextConfig, Message, Role, TokenUsage};
 use std::sync::Arc;
@@ -104,7 +104,11 @@ impl ContextManager {
     }
 
     /// 添加助手消息
-    pub async fn add_assistant_message(&self, content: impl Into<String>, tool_calls: Vec<raven_types::ToolCall>) {
+    pub async fn add_assistant_message(
+        &self,
+        content: impl Into<String>,
+        tool_calls: Vec<raven_types::ToolCall>,
+    ) {
         let mut msgs = self.messages.write().await;
         let mut msg = Message::assistant(content);
         if !tool_calls.is_empty() {
@@ -142,6 +146,19 @@ impl ContextManager {
         result
     }
 
+    /// 从 checkpoint 恢复消息历史（覆盖当前历史）。
+    /// 传入的消息若以 system 消息开头，会被剥离（系统提示词单独管理）。
+    pub async fn restore_messages(&self, restored: Vec<Message>) {
+        let mut msgs = self.messages.write().await;
+        msgs.clear();
+        for m in restored {
+            if m.role == raven_types::Role::System {
+                continue;
+            }
+            msgs.push(m);
+        }
+    }
+
     /// 判断是否需要压缩
     pub async fn should_compact(&self) -> bool {
         let tokens = self.estimate_tokens().await;
@@ -168,15 +185,16 @@ impl ContextManager {
         let summary = self.summarize(&to_compress);
 
         // 重建消息列表：摘要 + 保留的消息
-        let mut new_msgs = vec![Message::system(format!(
-            "[历史对话摘要] {}",
-            summary
-        ))];
+        let mut new_msgs = vec![Message::system(format!("[历史对话摘要] {}", summary))];
         new_msgs.extend(std::mem::take(&mut *msgs));
 
         *msgs = new_msgs;
 
-        info!("上下文已压缩: {} -> {} 条消息", to_compress.len() + keep_count, msgs.len());
+        info!(
+            "上下文已压缩: {} -> {} 条消息",
+            to_compress.len() + keep_count,
+            msgs.len()
+        );
 
         Ok(())
     }
@@ -263,8 +281,7 @@ impl ContextManager {
 
     /// 加载会话
     pub async fn load_session(&self, session_id: &str) -> Result<Vec<Message>, String> {
-        let store = self.session_store.as_ref()
-            .ok_or("会话持久化未启用")?;
+        let store = self.session_store.as_ref().ok_or("会话持久化未启用")?;
 
         let session = store.load(session_id)?;
 
@@ -369,7 +386,8 @@ impl ContextManager {
 
         // 去重
         let mut seen = std::collections::HashSet::new();
-        let unique: Vec<String> = topics.into_iter()
+        let unique: Vec<String> = topics
+            .into_iter()
             .filter(|t| seen.insert(t.clone()))
             .collect();
 
@@ -401,7 +419,8 @@ impl TokenBudget {
         if self.limit == 0 {
             return;
         }
-        self.used.fetch_add(tokens, std::sync::atomic::Ordering::Relaxed);
+        self.used
+            .fetch_add(tokens, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn check(&self) -> Result<(), raven_types::AgentError> {
@@ -417,7 +436,12 @@ impl TokenBudget {
         }
 
         if ratio >= 0.8 {
-            warn!("Token 预算即将用完: {}/{} ({:.0}%)", used, self.limit, ratio * 100.0);
+            warn!(
+                "Token 预算即将用完: {}/{} ({:.0}%)",
+                used,
+                self.limit,
+                ratio * 100.0
+            );
         }
 
         Ok(())

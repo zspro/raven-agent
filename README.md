@@ -18,9 +18,9 @@ A sharp, cross-platform AI agent in Rust. Named after the raven — nature's mos
 | **提供商验证 Provider verification** | 连通性 + 功能测试 + SHA256 指纹，自动检测异常端点 |
 | **10 个内置工具 Built-in tools** | file_read/write/edit/view/shell/search/list_dir/git/web_search/fetch_url |
 | **Claude Code 工具** | FileEdit（diff 编辑）、View（代码查看）、成本追踪 |
-| **MCP 协议** | 连接外部 MCP Server，无限扩展工具 |
+| **MCP 协议** | 连接外部 MCP Server，无限扩展工具（开发中，暂未接入主流程） |
 | **Git-first** | 每次编辑自动 git commit，`/settings` 可开关 |
-| **崩溃恢复 Crash recovery** | Checkpoint 系统，断线/崩溃后从断点继续 |
+| **崩溃恢复 Crash recovery** | Checkpoint 系统，每轮工具执行后落盘，崩溃/退出后启动时可恢复 |
 | **会话持久化 Session persistence** | 自动保存对话历史，启动时可恢复 |
 | **7 个提示词模板 Prompt templates** | coder/reviewer/architect/debugger/rust_expert/writer/default |
 | **跨平台 Cross-platform** | Linux / macOS / Windows / Android (Termux) |
@@ -189,7 +189,7 @@ enabled = true
 auto_commit = true
 commit_prefix = "raven"
 
-# MCP Server（可选）
+# MCP Server（开发中，配置项预留，暂未接入主流程）
 # [[mcp_servers]]
 # name = "fs"
 # command = "npx"
