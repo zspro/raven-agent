@@ -96,8 +96,10 @@ impl McpConnection {
         }
 
         let mut child = cmd.spawn().map_err(|e| {
-            format!("启动 MCP Server '{}' 失败: {} (命令: {} {:?})",
-                config.name, e, config.command, config.args)
+            format!(
+                "启动 MCP Server '{}' 失败: {} (命令: {} {:?})",
+                config.name, e, config.command, config.args
+            )
         })?;
 
         let stdin = child.stdin.take().ok_or("无法获取 stdin")?;
@@ -119,8 +121,11 @@ impl McpConnection {
         // 发现工具
         conn.discover_tools().await?;
 
-        info!("MCP Server '{}' 已连接，发现 {} 个工具",
-            config.name, conn.tools.len());
+        info!(
+            "MCP Server '{}' 已连接，发现 {} 个工具",
+            config.name,
+            conn.tools.len()
+        );
 
         Ok(conn)
     }
@@ -132,21 +137,27 @@ impl McpConnection {
 
     /// 将 MCP 工具转换为内部 ToolSchema
     pub fn to_tool_schemas(&self) -> Vec<ToolSchema> {
-        self.tools.iter().map(|t| ToolSchema {
-            schema_type: "function".to_string(),
-            function: FunctionSchema {
-                name: format!("{}__{}", self.name, t.name),
-                description: format!("[MCP:{}] {}", self.name, t.description),
-                parameters: t.input_schema.clone(),
-            },
-        }).collect()
+        self.tools
+            .iter()
+            .map(|t| ToolSchema {
+                schema_type: "function".to_string(),
+                function: FunctionSchema {
+                    name: format!("{}__{}", self.name, t.name),
+                    description: format!("[MCP:{}] {}", self.name, t.description),
+                    parameters: t.input_schema.clone(),
+                },
+            })
+            .collect()
     }
 
     /// 执行 MCP 工具调用
-    pub async fn execute(&mut self, tool_name: &str, arguments: serde_json::Value) -> Result<String, String> {
+    pub async fn execute(
+        &mut self,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<String, String> {
         // 提取原始工具名（去掉 server 前缀）
-        let original_name = tool_name.split("__").nth(1)
-            .unwrap_or(tool_name);
+        let original_name = tool_name.split("__").nth(1).unwrap_or(tool_name);
 
         let params = json!({
             "name": original_name,
@@ -158,10 +169,13 @@ impl McpConnection {
         // 解析工具调用结果
         if let Some(content) = result.get("content") {
             if let Some(items) = content.as_array() {
-                let texts: Vec<String> = items.iter()
+                let texts: Vec<String> = items
+                    .iter()
                     .filter_map(|item| {
                         if item.get("type").and_then(|t| t.as_str()) == Some("text") {
-                            item.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                            item.get("text")
+                                .and_then(|t| t.as_str())
+                                .map(|s| s.to_string())
                         } else {
                             None
                         }
@@ -181,7 +195,11 @@ impl McpConnection {
     // ===================================================================
 
     /// 发送 JSON-RPC 请求并等待响应
-    async fn request(&mut self, method: &str, params: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
+    async fn request(
+        &mut self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, String> {
         self.request_id += 1;
         let id = self.request_id;
 
@@ -192,16 +210,19 @@ impl McpConnection {
             params,
         };
 
-        let req_json = serde_json::to_string(&req)
-            .map_err(|e| format!("序列化请求失败: {}", e))?;
+        let req_json = serde_json::to_string(&req).map_err(|e| format!("序列化请求失败: {}", e))?;
 
         debug!("MCP -> {}: {}", self.name, req_json);
 
         // 发送（带长度前缀，LSP 风格）
         let msg = format!("Content-Length: {}\r\n\r\n{}", req_json.len(), req_json);
-        self.stdin.write_all(msg.as_bytes()).await
+        self.stdin
+            .write_all(msg.as_bytes())
+            .await
             .map_err(|e| format!("发送请求失败: {}", e))?;
-        self.stdin.flush().await
+        self.stdin
+            .flush()
+            .await
             .map_err(|e| format!("刷新失败: {}", e))?;
 
         // 读取响应头
@@ -223,14 +244,14 @@ impl McpConnection {
         let mut body = String::new();
         match self.stdout.read_line(&mut body).await {
             Ok(0) => return Err("MCP Server 断开连接".to_string()),
-            Ok(_) => {},
+            Ok(_) => {}
             Err(e) => return Err(format!("读取响应体失败: {}", e)),
         }
 
         debug!("MCP <- {}: {}", self.name, body.trim());
 
-        let resp: McpResponse = serde_json::from_str(&body)
-            .map_err(|e| format!("解析响应失败: {}", e))?;
+        let resp: McpResponse =
+            serde_json::from_str(&body).map_err(|e| format!("解析响应失败: {}", e))?;
 
         if let Some(err) = resp.error {
             return Err(format!("MCP 错误 [{}]: {}", err.code, err.message));
@@ -267,10 +288,9 @@ impl McpConnection {
         let result = self.request("tools/list", None).await?;
 
         if let Some(tools_arr) = result.get("tools").and_then(|t| t.as_array()) {
-            self.tools = tools_arr.iter()
-                .filter_map(|t| {
-                    serde_json::from_value::<McpTool>(t.clone()).ok()
-                })
+            self.tools = tools_arr
+                .iter()
+                .filter_map(|t| serde_json::from_value::<McpTool>(t.clone()).ok())
                 .collect();
         }
 
@@ -283,9 +303,17 @@ pub struct McpManager {
     connections: Vec<McpConnection>,
 }
 
+impl Default for McpManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl McpManager {
     pub fn new() -> Self {
-        Self { connections: Vec::new() }
+        Self {
+            connections: Vec::new(),
+        }
     }
 
     /// 添加 MCP Server 连接
@@ -304,17 +332,25 @@ impl McpManager {
 
     /// 获取所有 MCP 工具的 ToolSchema
     pub fn all_tool_schemas(&self) -> Vec<ToolSchema> {
-        self.connections.iter()
+        self.connections
+            .iter()
             .flat_map(|c| c.to_tool_schemas())
             .collect()
     }
 
     /// 执行 MCP 工具调用
-    pub async fn execute(&mut self, prefixed_name: &str, arguments: serde_json::Value) -> Result<String, String> {
+    pub async fn execute(
+        &mut self,
+        prefixed_name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<String, String> {
         // 解析 server__tool 格式的名称
         let parts: Vec<&str> = prefixed_name.split("__").collect();
         if parts.len() != 2 {
-            return Err(format!("无效的 MCP 工具名称: {} (应为 server__tool 格式)", prefixed_name));
+            return Err(format!(
+                "无效的 MCP 工具名称: {} (应为 server__tool 格式)",
+                prefixed_name
+            ));
         }
 
         let server_name = parts[0];
@@ -340,7 +376,8 @@ impl McpManager {
 
     /// 获取所有 MCP 工具名
     pub fn tool_names(&self) -> Vec<String> {
-        self.connections.iter()
+        self.connections
+            .iter()
             .flat_map(|c| c.tools().iter().map(|t| format!("{}__{}", c.name, t.name)))
             .collect()
     }

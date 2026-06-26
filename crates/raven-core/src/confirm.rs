@@ -121,8 +121,15 @@ pub fn describe_tool(tool: &str, args: &serde_json::Value) -> String {
             .get("path")
             .and_then(|v| v.as_str())
             .map(|p| {
-                let append = args.get("append").and_then(|v| v.as_bool()).unwrap_or(false);
-                let verb = if append { "追加写入" } else { "覆盖写入" };
+                let append = args
+                    .get("append")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let verb = if append {
+                    "追加写入"
+                } else {
+                    "覆盖写入"
+                };
                 format!("{verb}文件: {p}")
             })
             .unwrap_or_else(|| "写入文件".to_string()),

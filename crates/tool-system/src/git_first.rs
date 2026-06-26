@@ -36,7 +36,12 @@ impl GitFirst {
         };
 
         std::process::Command::new("git")
-            .args(&["-C", repo_path.to_str().unwrap_or("."), "rev-parse", "--git-dir"])
+            .args([
+                "-C",
+                repo_path.to_str().unwrap_or("."),
+                "rev-parse",
+                "--git-dir",
+            ])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
@@ -54,12 +59,7 @@ impl GitFirst {
 
         // 获取当前 HEAD hash（用于回滚）
         let output = std::process::Command::new("git")
-            .args(&[
-                "-C",
-                repo_path.to_str().unwrap_or("."),
-                "rev-parse",
-                "HEAD",
-            ])
+            .args(["-C", repo_path.to_str().unwrap_or("."), "rev-parse", "HEAD"])
             .output()
             .map_err(|e| format!("git 失败: {}", e))?;
 
@@ -92,7 +92,7 @@ impl GitFirst {
 
         // 1. git add
         let add_output = std::process::Command::new("git")
-            .args(&["-C", repo_str, "add", path])
+            .args(["-C", repo_str, "add", path])
             .output()
             .map_err(|e| format!("git add 失败: {}", e))?;
 
@@ -103,7 +103,7 @@ impl GitFirst {
 
         // 2. 检查是否有变更要提交
         let diff_check = std::process::Command::new("git")
-            .args(&["-C", repo_str, "diff", "--cached", "--quiet"])
+            .args(["-C", repo_str, "diff", "--cached", "--quiet"])
             .output()
             .map_err(|e| format!("git diff 失败: {}", e))?;
 
@@ -125,7 +125,7 @@ impl GitFirst {
         );
 
         let commit_output = std::process::Command::new("git")
-            .args(&["-C", repo_str, "commit", "-m", &commit_msg])
+            .args(["-C", repo_str, "commit", "-m", &commit_msg])
             .output()
             .map_err(|e| format!("git commit 失败: {}", e))?;
 
@@ -140,7 +140,7 @@ impl GitFirst {
 
         // 获取新的 commit hash
         let hash_output = std::process::Command::new("git")
-            .args(&["-C", repo_str, "rev-parse", "--short", "HEAD"])
+            .args(["-C", repo_str, "rev-parse", "--short", "HEAD"])
             .output()
             .map_err(|e| format!("获取 commit hash 失败: {}", e))?;
 
@@ -171,7 +171,7 @@ impl GitFirst {
 
         // git checkout 文件到之前的版本
         let output = std::process::Command::new("git")
-            .args(&["-C", repo_str, "checkout", before_hash, "--", path])
+            .args(["-C", repo_str, "checkout", before_hash, "--", path])
             .output()
             .map_err(|e| format!("回滚失败: {}", e))?;
 
@@ -191,7 +191,7 @@ impl GitFirst {
             .unwrap_or(std::path::Path::new("."));
 
         let output = std::process::Command::new("git")
-            .args(&[
+            .args([
                 "-C",
                 repo_path.to_str().unwrap_or("."),
                 "log",

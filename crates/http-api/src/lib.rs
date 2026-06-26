@@ -1,9 +1,6 @@
 //! # http-api
 //! HTTP API 服务器（axum + SSE）
 
-use raven_core::{Agent, DoctorResult};
-use raven_types::*;
-use axum;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -11,6 +8,8 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use raven_core::{Agent, DoctorResult};
+use raven_types::*;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -37,12 +36,24 @@ pub fn create_routes(agent: Arc<Agent>) -> Router {
         .route("/api/v1/session", get(handle_session_info))
         .route("/api/v1/session/clear", post(handle_clear_session))
         // 会话管理（Phase 4）
-        .route("/api/v1/sessions", get(handle_list_sessions).post(handle_create_session))
-        .route("/api/v1/sessions/:id", get(handle_load_session).delete(handle_delete_session))
+        .route(
+            "/api/v1/sessions",
+            get(handle_list_sessions).post(handle_create_session),
+        )
+        .route(
+            "/api/v1/sessions/:id",
+            get(handle_load_session).delete(handle_delete_session),
+        )
         .route("/api/v1/sessions/current", get(handle_current_session))
-        .route("/api/v1/sessions/:id/messages", get(handle_session_messages))
+        .route(
+            "/api/v1/sessions/:id/messages",
+            get(handle_session_messages),
+        )
         .route("/health", get(handle_health))
-        .nest_service("/", ServeDir::new("web").append_index_html_on_directories(true))
+        .nest_service(
+            "/",
+            ServeDir::new("web").append_index_html_on_directories(true),
+        )
         .layer(cors)
         .with_state(agent)
 }
@@ -143,7 +154,8 @@ async fn handle_chat_stream(
                 }
             }
             Err(e) => {
-                let data = serde_json::to_string(&StreamEvent::error(e.to_string())).unwrap_or_default();
+                let data =
+                    serde_json::to_string(&StreamEvent::error(e.to_string())).unwrap_or_default();
                 let _ = tx.send(Ok(Event::default().data(data))).await;
             }
         }
@@ -152,17 +164,13 @@ async fn handle_chat_stream(
     Sse::new(ReceiverStream::new(rx))
 }
 
-async fn handle_list_models(
-    State(agent): State<Arc<Agent>>,
-) -> Json<ModelsResponse> {
+async fn handle_list_models(State(agent): State<Arc<Agent>>) -> Json<ModelsResponse> {
     let models = agent.list_models().await;
     let count = models.len();
     Json(ModelsResponse { models, count })
 }
 
-async fn handle_verify_models(
-    State(agent): State<Arc<Agent>>,
-) -> Json<Vec<ProviderVerification>> {
+async fn handle_verify_models(State(agent): State<Arc<Agent>>) -> Json<Vec<ProviderVerification>> {
     let results = agent.verify_providers().await;
     Json(results)
 }
@@ -180,24 +188,18 @@ async fn handle_list_tools() -> Json<serde_json::Value> {
     }))
 }
 
-async fn handle_doctor(
-    State(agent): State<Arc<Agent>>,
-) -> Json<DoctorResponse> {
+async fn handle_doctor(State(agent): State<Arc<Agent>>) -> Json<DoctorResponse> {
     let checks = agent.doctor();
     let healthy = checks.iter().all(|c| c.status == "ok");
     Json(DoctorResponse { healthy, checks })
 }
 
-async fn handle_token_usage(
-    State(agent): State<Arc<Agent>>,
-) -> Json<serde_json::Value> {
+async fn handle_token_usage(State(agent): State<Arc<Agent>>) -> Json<serde_json::Value> {
     let stats = agent.stats().await;
     Json(serde_json::json!(stats))
 }
 
-async fn handle_session_info(
-    State(agent): State<Arc<Agent>>,
-) -> Json<serde_json::Value> {
+async fn handle_session_info(State(agent): State<Arc<Agent>>) -> Json<serde_json::Value> {
     let stats = agent.stats().await;
     let messages = agent.messages().await;
     Json(serde_json::json!({
@@ -206,9 +208,7 @@ async fn handle_session_info(
     }))
 }
 
-async fn handle_clear_session(
-    State(agent): State<Arc<Agent>>,
-) -> Json<serde_json::Value> {
+async fn handle_clear_session(State(agent): State<Arc<Agent>>) -> Json<serde_json::Value> {
     agent.clear().await;
     Json(serde_json::json!({
         "status": "ok",
@@ -227,9 +227,7 @@ async fn handle_health() -> Json<serde_json::Value> {
 // 会话管理（Phase 4）
 // =============================================================================
 
-async fn handle_list_sessions(
-    State(agent): State<Arc<Agent>>,
-) -> Json<serde_json::Value> {
+async fn handle_list_sessions(State(agent): State<Arc<Agent>>) -> Json<serde_json::Value> {
     let sessions = agent.list_sessions();
     Json(serde_json::json!({
         "sessions": sessions,
@@ -237,9 +235,7 @@ async fn handle_list_sessions(
     }))
 }
 
-async fn handle_create_session(
-    State(agent): State<Arc<Agent>>,
-) -> Json<serde_json::Value> {
+async fn handle_create_session(State(agent): State<Arc<Agent>>) -> Json<serde_json::Value> {
     let session_id = agent.create_session().await;
     Json(serde_json::json!({
         "status": "ok",
@@ -281,9 +277,7 @@ async fn handle_delete_session(
     }
 }
 
-async fn handle_current_session(
-    State(agent): State<Arc<Agent>>,
-) -> Json<serde_json::Value> {
+async fn handle_current_session(State(agent): State<Arc<Agent>>) -> Json<serde_json::Value> {
     let session_id = agent.current_session_id().await;
     Json(serde_json::json!({
         "session_id": session_id,

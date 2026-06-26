@@ -3,6 +3,7 @@
 //! 测试即文档：每个测试描述一个使用场景。
 
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     use crate::init_config;
 

@@ -5,8 +5,8 @@
 //! 提供更丰富的查看体验（行号、滚动、目录树）。
 
 use super::Tool;
-use raven_types::{FunctionSchema, ToolSchema};
 use async_trait::async_trait;
+use raven_types::{FunctionSchema, ToolSchema};
 use serde_json::json;
 use std::path::Path;
 
@@ -14,8 +14,12 @@ pub struct ViewTool;
 
 #[async_trait]
 impl Tool for ViewTool {
-    fn name(&self) -> &str { "view" }
-    fn description(&self) -> &str { "查看文件内容或目录结构（带行号）" }
+    fn name(&self) -> &str {
+        "view"
+    }
+    fn description(&self) -> &str {
+        "查看文件内容或目录结构（带行号）"
+    }
 
     fn schema(&self) -> ToolSchema {
         ToolSchema {
@@ -50,7 +54,8 @@ impl Tool for ViewTool {
         let path = Path::new(path_str);
 
         // 检查是文件还是目录
-        let metadata = tokio::fs::metadata(path).await
+        let metadata = tokio::fs::metadata(path)
+            .await
             .map_err(|e| format!("无法访问 '{}': {}", path_str, e))?;
 
         if metadata.is_dir() {
@@ -64,8 +69,13 @@ impl Tool for ViewTool {
 }
 
 /// 查看文件内容（带行号）
-async fn view_file(path: &Path, offset: Option<usize>, limit: Option<usize>) -> Result<String, String> {
-    let content = tokio::fs::read_to_string(path).await
+async fn view_file(
+    path: &Path,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<String, String> {
+    let content = tokio::fs::read_to_string(path)
+        .await
         .map_err(|e| format!("读取文件失败: {}", e))?;
 
     let lines: Vec<&str> = content.lines().collect();
@@ -73,7 +83,7 @@ async fn view_file(path: &Path, offset: Option<usize>, limit: Option<usize>) -> 
 
     // 默认参数
     let offset = offset.unwrap_or(1); // 默认从第1行开始
-    let limit = limit.unwrap_or(50);  // 默认显示50行
+    let limit = limit.unwrap_or(50); // 默认显示50行
 
     // 转换为 0-indexed
     let start = offset.saturating_sub(1).min(total_lines);
@@ -84,12 +94,21 @@ async fn view_file(path: &Path, offset: Option<usize>, limit: Option<usize>) -> 
 
     // 文件头
     let size = format_size(std::fs::metadata(path).map(|m| m.len()).unwrap_or(0));
-    output_lines.push(format!("📄 {} ({} 行, {})", path.display(), total_lines, size));
+    output_lines.push(format!(
+        "📄 {} ({} 行, {})",
+        path.display(),
+        total_lines,
+        size
+    ));
     output_lines.push("─".repeat(60));
 
     // 如果跳过了开头，显示省略号
     if start > 0 {
-        output_lines.push(format!("    ... (前 {} 行省略，使用 offset={} 查看)", start, start + 1));
+        output_lines.push(format!(
+            "    ... (前 {} 行省略，使用 offset={} 查看)",
+            start,
+            start + 1
+        ));
     }
 
     // 内容行
@@ -110,7 +129,10 @@ async fn view_file(path: &Path, offset: Option<usize>, limit: Option<usize>) -> 
     output_lines.push("─".repeat(60));
     output_lines.push(format!(
         "显示 {}-{} / {} 行 | 使用 offset={} 查看下一页",
-        start + 1, end, total_lines, end + 1
+        start + 1,
+        end,
+        total_lines,
+        end + 1
     ));
 
     Ok(output_lines.join("\n"))
@@ -118,14 +140,19 @@ async fn view_file(path: &Path, offset: Option<usize>, limit: Option<usize>) -> 
 
 /// 查看目录（树形结构）
 async fn view_directory(path: &Path) -> Result<String, String> {
-    let mut entries = tokio::fs::read_dir(path).await
+    let mut entries = tokio::fs::read_dir(path)
+        .await
         .map_err(|e| format!("读取目录失败: {}", e))?;
 
     let mut dirs = Vec::new();
     let mut files = Vec::new();
     let mut total_size: u64 = 0;
 
-    while let Some(entry) = entries.next_entry().await.map_err(|e| format!("读取条目失败: {}", e))? {
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| format!("读取条目失败: {}", e))?
+    {
         let name = entry.file_name().to_string_lossy().to_string();
         let meta = entry.metadata().await.ok();
 
@@ -149,8 +176,13 @@ async fn view_directory(path: &Path) -> Result<String, String> {
     // 构建输出
     let mut lines = Vec::new();
 
-    lines.push(format!("📁 {} ({} 子目录, {} 文件, 共 {})",
-        path.display(), dirs.len(), files.len(), format_size(total_size)));
+    lines.push(format!(
+        "📁 {} ({} 子目录, {} 文件, 共 {})",
+        path.display(),
+        dirs.len(),
+        files.len(),
+        format_size(total_size)
+    ));
     lines.push("─".repeat(50));
 
     // 子目录
@@ -169,8 +201,14 @@ async fn view_directory(path: &Path) -> Result<String, String> {
         for (name, size) in &files {
             let indent = "    ";
             // 根据扩展名添加图标
-            let icon = get_file_icon(&name);
-            lines.push(format!("{}├── {} {} ({})", indent, icon, name, format_size(*size)));
+            let icon = get_file_icon(name);
+            lines.push(format!(
+                "{}├── {} {} ({})",
+                indent,
+                icon,
+                name,
+                format_size(*size)
+            ));
         }
     }
 

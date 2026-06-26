@@ -3,8 +3,8 @@
 //! 将会话历史保存到 `~/.raven/sessions/` 目录下的 JSON 文件。
 //! 每个会话一个文件，格式简洁，便于人工查看和迁移。
 
-use raven_types::Message;
 use chrono::{DateTime, Local};
+use raven_types::Message;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tracing::{debug, error, info};
@@ -42,12 +42,12 @@ impl SessionStore {
     /// 创建会话存储（目录不存在则自动创建）
     pub fn new(dir: impl AsRef<Path>) -> Result<Self, String> {
         let dir = dir.as_ref().to_path_buf();
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("创建会话目录失败: {}", e))?;
+        std::fs::create_dir_all(&dir).map_err(|e| format!("创建会话目录失败: {}", e))?;
         Ok(Self { dir })
     }
 
     /// 从默认位置创建 (~/.raven/sessions)
+    #[allow(clippy::should_implement_trait)]
     pub fn default() -> Result<Self, String> {
         let home = dirs::home_dir().ok_or("无法获取家目录")?;
         Self::new(home.join(".raven").join("sessions"))
@@ -95,11 +95,10 @@ impl SessionStore {
         };
 
         let path = self.session_path(&meta.id);
-        let content = serde_json::to_string_pretty(&session)
-            .map_err(|e| format!("序列化失败: {}", e))?;
+        let content =
+            serde_json::to_string_pretty(&session).map_err(|e| format!("序列化失败: {}", e))?;
 
-        std::fs::write(&path, content)
-            .map_err(|e| format!("写入失败: {}", e))?;
+        std::fs::write(&path, content).map_err(|e| format!("写入失败: {}", e))?;
 
         info!("会话已保存: {} ({} 条消息)", meta.id, meta.message_count);
         Ok(())
@@ -112,13 +111,15 @@ impl SessionStore {
             return Err(format!("会话不存在: {}", session_id));
         }
 
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| format!("读取失败: {}", e))?;
+        let content = std::fs::read_to_string(&path).map_err(|e| format!("读取失败: {}", e))?;
 
-        let session: Session = serde_json::from_str(&content)
-            .map_err(|e| format!("解析失败: {}", e))?;
+        let session: Session =
+            serde_json::from_str(&content).map_err(|e| format!("解析失败: {}", e))?;
 
-        debug!("会话已加载: {} ({} 条消息)", session_id, session.meta.message_count);
+        debug!(
+            "会话已加载: {} ({} 条消息)",
+            session_id, session.meta.message_count
+        );
         Ok(session)
     }
 
@@ -153,7 +154,7 @@ impl SessionStore {
         }
 
         // 按更新时间倒序
-        sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        sessions.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
         sessions
     }
 
@@ -164,8 +165,7 @@ impl SessionStore {
             return Err(format!("会话不存在: {}", session_id));
         }
 
-        std::fs::remove_file(&path)
-            .map_err(|e| format!("删除失败: {}", e))?;
+        std::fs::remove_file(&path).map_err(|e| format!("删除失败: {}", e))?;
 
         info!("会话已删除: {}", session_id);
         Ok(())

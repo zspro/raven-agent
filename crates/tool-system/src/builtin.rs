@@ -1,8 +1,8 @@
 //! 内置工具实现
 
 use super::Tool;
-use raven_types::{FunctionSchema, ToolSchema};
 use async_trait::async_trait;
+use raven_types::{FunctionSchema, ToolSchema};
 use serde_json::json;
 use std::path::Path;
 
@@ -14,15 +14,20 @@ pub struct FileReadTool;
 
 #[async_trait]
 impl Tool for FileReadTool {
-    fn name(&self) -> &str { "file_read" }
-    fn description(&self) -> &str { "读取文件内容，支持行号范围和行数限制" }
+    fn name(&self) -> &str {
+        "file_read"
+    }
+    fn description(&self) -> &str {
+        "读取文件内容，支持行号范围和行数限制"
+    }
 
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             schema_type: "function".to_string(),
             function: FunctionSchema {
                 name: "file_read".to_string(),
-                description: "读取指定文件的内容。支持文本文件。如果文件太大，会自动截断。".to_string(),
+                description: "读取指定文件的内容。支持文本文件。如果文件太大，会自动截断。"
+                    .to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -40,7 +45,8 @@ impl Tool for FileReadTool {
         let path = args["path"].as_str().ok_or("缺少 path 参数")?;
         let path = Path::new(path);
 
-        let content = tokio::fs::read_to_string(path).await
+        let content = tokio::fs::read_to_string(path)
+            .await
             .map_err(|e| format!("读取失败: {}", e))?;
 
         let offset = args["offset"].as_u64().unwrap_or(0) as usize;
@@ -50,12 +56,14 @@ impl Tool for FileReadTool {
         let start = offset.min(lines.len());
         let end = (offset + limit).min(lines.len());
 
-        let selected: Vec<String> = lines[start..end].iter()
+        let selected: Vec<String> = lines[start..end]
+            .iter()
             .enumerate()
             .map(|(i, line)| format!("{:4} | {}", start + i + 1, line))
             .collect();
 
-        Ok(format!("文件: {} (共{}行)\n{}",
+        Ok(format!(
+            "文件: {} (共{}行)\n{}",
             path.display(),
             lines.len(),
             selected.join("\n")
@@ -71,8 +79,12 @@ pub struct FileWriteTool;
 
 #[async_trait]
 impl Tool for FileWriteTool {
-    fn name(&self) -> &str { "file_write" }
-    fn description(&self) -> &str { "写入或追加文件内容" }
+    fn name(&self) -> &str {
+        "file_write"
+    }
+    fn description(&self) -> &str {
+        "写入或追加文件内容"
+    }
 
     fn schema(&self) -> ToolSchema {
         ToolSchema {
@@ -99,9 +111,13 @@ impl Tool for FileWriteTool {
         let append = args["append"].as_bool().unwrap_or(false);
 
         if append {
-            tokio::fs::write(path, content).await.map_err(|e| format!("写入失败: {}", e))?;
+            tokio::fs::write(path, content)
+                .await
+                .map_err(|e| format!("写入失败: {}", e))?;
         } else {
-            tokio::fs::write(path, content).await.map_err(|e| format!("写入失败: {}", e))?;
+            tokio::fs::write(path, content)
+                .await
+                .map_err(|e| format!("写入失败: {}", e))?;
         }
 
         let mode = if append { "追加" } else { "覆盖" };
@@ -147,13 +163,13 @@ impl ShellTool {
 fn default_shell_allowed() -> Vec<String> {
     #[cfg(windows)]
     let cmds = [
-        "dir", "type", "findstr", "where", "git", "go", "npm", "node",
-        "echo", "cd", "more", "tree", "curl", "python", "cargo",
+        "dir", "type", "findstr", "where", "git", "go", "npm", "node", "echo", "cd", "more",
+        "tree", "curl", "python", "cargo",
     ];
     #[cfg(not(windows))]
     let cmds = [
-        "ls", "cat", "grep", "find", "git", "go", "npm", "node", "echo",
-        "pwd", "head", "tail", "wc", "mkdir", "touch", "cp", "mv", "curl",
+        "ls", "cat", "grep", "find", "git", "go", "npm", "node", "echo", "pwd", "head", "tail",
+        "wc", "mkdir", "touch", "cp", "mv", "curl",
     ];
     cmds.iter().map(|s| s.to_string()).collect()
 }
@@ -189,15 +205,21 @@ fn is_dangerous_command(command: &str) -> Option<&'static str> {
 
 #[async_trait]
 impl Tool for ShellTool {
-    fn name(&self) -> &str { "shell" }
-    fn description(&self) -> &str { "执行 Shell 命令（有安全限制）" }
+    fn name(&self) -> &str {
+        "shell"
+    }
+    fn description(&self) -> &str {
+        "执行 Shell 命令（有安全限制）"
+    }
 
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             schema_type: "function".to_string(),
             function: FunctionSchema {
                 name: "shell".to_string(),
-                description: "执行 Shell 命令。支持常用命令如 ls、cat、grep、find、git 等。超时 30 秒。".to_string(),
+                description:
+                    "执行 Shell 命令。支持常用命令如 ls、cat、grep、find、git 等。超时 30 秒。"
+                        .to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -232,27 +254,25 @@ impl Tool for ShellTool {
             ));
         }
 
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout),
-            {
-                // 跨平台 shell：Windows 用 cmd /C，其余用 sh -c
-                #[cfg(windows)]
-                let mut c = {
-                    let mut c = tokio::process::Command::new("cmd");
-                    c.arg("/C");
-                    c
-                };
-                #[cfg(not(windows))]
-                let mut c = {
-                    let mut c = tokio::process::Command::new("sh");
-                    c.arg("-c");
-                    c
-                };
-                c.arg(command).output()
-            },
-        ).await
-            .map_err(|_| "命令超时")?
-            .map_err(|e| format!("执行失败: {}", e))?;
+        let output = tokio::time::timeout(std::time::Duration::from_secs(timeout), {
+            // 跨平台 shell：Windows 用 cmd /C，其余用 sh -c
+            #[cfg(windows)]
+            let mut c = {
+                let mut c = tokio::process::Command::new("cmd");
+                c.arg("/C");
+                c
+            };
+            #[cfg(not(windows))]
+            let mut c = {
+                let mut c = tokio::process::Command::new("sh");
+                c.arg("-c");
+                c
+            };
+            c.arg(command).output()
+        })
+        .await
+        .map_err(|_| "命令超时")?
+        .map_err(|e| format!("执行失败: {}", e))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -277,8 +297,12 @@ pub struct SearchTool;
 
 #[async_trait]
 impl Tool for SearchTool {
-    fn name(&self) -> &str { "search" }
-    fn description(&self) -> &str { "在文件中搜索内容" }
+    fn name(&self) -> &str {
+        "search"
+    }
+    fn description(&self) -> &str {
+        "在文件中搜索内容"
+    }
 
     fn schema(&self) -> ToolSchema {
         ToolSchema {
@@ -304,7 +328,9 @@ impl Tool for SearchTool {
         let pattern = args["pattern"].as_str().ok_or("缺少 pattern 参数")?;
         let path = args["path"].as_str().unwrap_or(".").to_string();
         let max_results = args["max_results"].as_u64().unwrap_or(20) as usize;
-        let ext = args["ext"].as_str().map(|e| e.trim_start_matches('.').to_string());
+        let ext = args["ext"]
+            .as_str()
+            .map(|e| e.trim_start_matches('.').to_string());
 
         // 纯 Rust 实现，跨平台、不依赖外部 grep。大小写不敏感。
         let re = regex::RegexBuilder::new(pattern)
@@ -332,10 +358,7 @@ impl Tool for SearchTool {
                     // 跳过隐藏目录与常见噪音目录
                     let name = entry.file_name().to_string_lossy().to_string();
                     if ft.is_dir() {
-                        if name.starts_with('.')
-                            || name == "target"
-                            || name == "node_modules"
-                        {
+                        if name.starts_with('.') || name == "target" || name == "node_modules" {
                             continue;
                         }
                         stack.push(p);
@@ -380,7 +403,11 @@ impl Tool for SearchTool {
         if matches.is_empty() {
             Ok("未找到匹配".to_string())
         } else {
-            Ok(format!("找到 {} 个匹配:\n{}", matches.len(), matches.join("\n")))
+            Ok(format!(
+                "找到 {} 个匹配:\n{}",
+                matches.len(),
+                matches.join("\n")
+            ))
         }
     }
 }
@@ -393,8 +420,12 @@ pub struct ListDirTool;
 
 #[async_trait]
 impl Tool for ListDirTool {
-    fn name(&self) -> &str { "list_dir" }
-    fn description(&self) -> &str { "列出目录内容" }
+    fn name(&self) -> &str {
+        "list_dir"
+    }
+    fn description(&self) -> &str {
+        "列出目录内容"
+    }
 
     fn schema(&self) -> ToolSchema {
         ToolSchema {
@@ -415,13 +446,18 @@ impl Tool for ListDirTool {
     async fn execute(&self, args: serde_json::Value) -> Result<String, String> {
         let path = args["path"].as_str().unwrap_or(".");
 
-        let mut entries = tokio::fs::read_dir(path).await
+        let mut entries = tokio::fs::read_dir(path)
+            .await
             .map_err(|e| format!("读取目录失败: {}", e))?;
 
         let mut dirs = Vec::new();
         let mut files = Vec::new();
 
-        while let Some(entry) = entries.next_entry().await.map_err(|e| format!("读取条目失败: {}", e))? {
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| format!("读取条目失败: {}", e))?
+        {
             let name = entry.file_name().to_string_lossy().to_string();
             let metadata = entry.metadata().await.ok();
 
@@ -435,10 +471,23 @@ impl Tool for ListDirTool {
             }
         }
 
-        let dirs_str = if dirs.is_empty() { "(无)".to_string() } else { dirs.join("\n  ") };
-        let files_str = if files.is_empty() { "(无)".to_string() } else { files.join("\n  ") };
-        Ok(format!("目录: {}\n\n子目录 ({}):\n  {}\n\n文件 ({}):\n  {}",
-            path, dirs.len(), dirs_str, files.len(), files_str,
+        let dirs_str = if dirs.is_empty() {
+            "(无)".to_string()
+        } else {
+            dirs.join("\n  ")
+        };
+        let files_str = if files.is_empty() {
+            "(无)".to_string()
+        } else {
+            files.join("\n  ")
+        };
+        Ok(format!(
+            "目录: {}\n\n子目录 ({}):\n  {}\n\n文件 ({}):\n  {}",
+            path,
+            dirs.len(),
+            dirs_str,
+            files.len(),
+            files_str,
         ))
     }
 }
@@ -451,15 +500,21 @@ pub struct GitTool;
 
 #[async_trait]
 impl Tool for GitTool {
-    fn name(&self) -> &str { "git" }
-    fn description(&self) -> &str { "执行 Git 命令" }
+    fn name(&self) -> &str {
+        "git"
+    }
+    fn description(&self) -> &str {
+        "执行 Git 命令"
+    }
 
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             schema_type: "function".to_string(),
             function: FunctionSchema {
                 name: "git".to_string(),
-                description: "执行 Git 命令。支持 status、log、diff、branch 等只读操作，以及 commit。".to_string(),
+                description:
+                    "执行 Git 命令。支持 status、log、diff、branch 等只读操作，以及 commit。"
+                        .to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -477,7 +532,10 @@ impl Tool for GitTool {
         let extra = args["args"].as_str().unwrap_or("");
 
         // 安全检查
-        let allowed = ["status", "log", "diff", "branch", "show", "blame", "remote", "config", "commit", "add", "init"];
+        let allowed = [
+            "status", "log", "diff", "branch", "show", "blame", "remote", "config", "commit",
+            "add", "init",
+        ];
         if !allowed.contains(&command) {
             return Err(format!("不支持的 git 命令: {}", command));
         }
@@ -488,7 +546,9 @@ impl Tool for GitTool {
             cmd.args(extra.split_whitespace());
         }
 
-        let output = cmd.output().await
+        let output = cmd
+            .output()
+            .await
             .map_err(|e| format!("git 执行失败: {}", e))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -498,7 +558,11 @@ impl Tool for GitTool {
             return Err(format!("{}", stderr));
         }
 
-        Ok(if stderr.is_empty() { stdout.to_string() } else { format!("{}\n[stderr]: {}", stdout, stderr) })
+        Ok(if stderr.is_empty() {
+            stdout.to_string()
+        } else {
+            format!("{}\n[stderr]: {}", stdout, stderr)
+        })
     }
 }
 

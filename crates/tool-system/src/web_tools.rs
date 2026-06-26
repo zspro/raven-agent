@@ -3,8 +3,8 @@
 //! 让 Agent 可以搜索网页和获取页面内容，获取实时信息。
 
 use super::Tool;
-use raven_types::{FunctionSchema, ToolSchema};
 use async_trait::async_trait;
+use raven_types::{FunctionSchema, ToolSchema};
 use serde_json::json;
 use std::sync::LazyLock;
 
@@ -25,8 +25,12 @@ pub struct WebSearchTool;
 
 #[async_trait]
 impl Tool for WebSearchTool {
-    fn name(&self) -> &str { "web_search" }
-    fn description(&self) -> &str { "搜索网页内容" }
+    fn name(&self) -> &str {
+        "web_search"
+    }
+    fn description(&self) -> &str {
+        "搜索网页内容"
+    }
 
     fn schema(&self) -> ToolSchema {
         ToolSchema {
@@ -82,7 +86,10 @@ impl Tool for WebSearchTool {
                     for (i, (title, link, snippet)) in results.iter().enumerate() {
                         output.push_str(&format!(
                             "{}. {}\n   {}\n   {}\n\n",
-                            i + 1, title, link, snippet
+                            i + 1,
+                            title,
+                            link,
+                            snippet
                         ));
                     }
                     return Ok(output);
@@ -91,8 +98,12 @@ impl Tool for WebSearchTool {
         }
 
         // 兜底：DDG（Lite / HTML 结果已在并行请求中取得）
-        if let Some(ddg) = ddg_lite { return Ok(ddg); }
-        if let Some(ddg) = ddg_html { return Ok(ddg); }
+        if let Some(ddg) = ddg_lite {
+            return Ok(ddg);
+        }
+        if let Some(ddg) = ddg_html {
+            return Ok(ddg);
+        }
 
         // 全部失败
         Ok(format!(
@@ -110,8 +121,12 @@ pub struct FetchUrlTool;
 
 #[async_trait]
 impl Tool for FetchUrlTool {
-    fn name(&self) -> &str { "fetch_url" }
-    fn description(&self) -> &str { "获取网页的文本内容" }
+    fn name(&self) -> &str {
+        "fetch_url"
+    }
+    fn description(&self) -> &str {
+        "获取网页的文本内容"
+    }
 
     fn schema(&self) -> ToolSchema {
         ToolSchema {
@@ -171,7 +186,11 @@ impl Tool for FetchUrlTool {
         // 提取文本内容
         let text = extract_text_from_html(&body);
         let truncated = if text.len() > max_len {
-            format!("{}...\n\n[已截断，共 {} 字符]", &text[..max_len], text.len())
+            format!(
+                "{}...\n\n[已截断，共 {} 字符]",
+                &text[..max_len],
+                text.len()
+            )
         } else {
             text
         };
@@ -199,27 +218,44 @@ fn parse_bing_results(html: &str, max: usize) -> Vec<(String, String, String)> {
         r#"(?s)<li[^>]*class="[^"]*\bb_ans\b[^"]*"[^>]*>(.*?)</li>"#,
     ];
 
+    let re_link = regex::Regex::new(r#"<a[^>]*href="(https?://[^"]+)"[^>]*>(.*?)</a>"#).ok();
+    let re_snippet = regex::Regex::new(r#"(?s)<p[^>]*>(.*?)</p>"#).ok();
+
     for pat in patterns {
-        if results.len() >= max { break; }
-        let re_item = match regex::Regex::new(pat) { Ok(r) => r, Err(_) => continue };
-        let re_link = regex::Regex::new(r#"<a[^>]*href="(https?://[^"]+)"[^>]*>(.*?)</a>"#).ok();
-        let re_snippet = regex::Regex::new(r#"(?s)<p[^>]*>(.*?)</p>"#).ok();
+        if results.len() >= max {
+            break;
+        }
+        let re_item = match regex::Regex::new(pat) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
 
         for cap in re_item.captures_iter(html) {
-            if results.len() >= max { break; }
-            let item = match cap.get(1) { Some(m) => m.as_str(), None => continue };
+            if results.len() >= max {
+                break;
+            }
+            let item = match cap.get(1) {
+                Some(m) => m.as_str(),
+                None => continue,
+            };
 
             let (link, title) = match re_link.as_ref().and_then(|re| re.captures(item)) {
                 Some(c) => {
-                    let link = c.get(1).map(|m| decode_html(m.as_str())).unwrap_or_default();
+                    let link = c
+                        .get(1)
+                        .map(|m| decode_html(m.as_str()))
+                        .unwrap_or_default();
                     let title = c.get(2).map(|m| strip_html(m.as_str())).unwrap_or_default();
                     (link, title)
                 }
                 None => continue,
             };
-            if title.is_empty() || link.is_empty() { continue; }
+            if title.is_empty() || link.is_empty() {
+                continue;
+            }
 
-            let snippet = re_snippet.as_ref()
+            let snippet = re_snippet
+                .as_ref()
                 .and_then(|re| re.captures(item))
                 .and_then(|c| c.get(1))
                 .map(|m| strip_html(m.as_str()))
@@ -236,11 +272,22 @@ fn parse_bing_results(html: &str, max: usize) -> Vec<(String, String, String)> {
         ).ok();
         if let Some(re) = re_cite_block {
             for cap in re.captures_iter(html) {
-                if results.len() >= max { break; }
-                let url = cap.get(2).map(|m| decode_html(m.as_str())).unwrap_or_default();
-                let title = cap.get(3).map(|m| strip_html(m.as_str())).unwrap_or_default();
+                if results.len() >= max {
+                    break;
+                }
+                let url = cap
+                    .get(2)
+                    .map(|m| decode_html(m.as_str()))
+                    .unwrap_or_default();
+                let title = cap
+                    .get(3)
+                    .map(|m| strip_html(m.as_str()))
+                    .unwrap_or_default();
                 if !title.is_empty() && !url.is_empty() {
-                    let snippet = cap.get(1).map(|m| strip_html(m.as_str())).unwrap_or_default();
+                    let snippet = cap
+                        .get(1)
+                        .map(|m| strip_html(m.as_str()))
+                        .unwrap_or_default();
                     results.push((title, url, snippet));
                 }
             }
@@ -258,22 +305,34 @@ fn parse_ddg_lite_results(html: &str, max: usize) -> Vec<(String, String, String
         Ok(re) => re,
         Err(_) => return results,
     };
-    let re_link = regex::Regex::new(r#"<a[^>]*class="result-link"[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#).ok();
+    let re_link =
+        regex::Regex::new(r#"<a[^>]*class="result-link"[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#).ok();
     let re_snip = regex::Regex::new(r#"(?s)<td[^>]*class="result-snippet"[^>]*>(.*?)</td>"#).ok();
 
     for row_cap in re_row.captures_iter(html) {
-        if results.len() >= max { break; }
-        let row = match row_cap.get(1) { Some(m) => m.as_str(), None => continue };
+        if results.len() >= max {
+            break;
+        }
+        let row = match row_cap.get(1) {
+            Some(m) => m.as_str(),
+            None => continue,
+        };
         let (link, title) = match re_link.as_ref().and_then(|re| re.captures(row)) {
             Some(c) => {
-                let link = c.get(1).map(|m| decode_html(m.as_str())).unwrap_or_default();
+                let link = c
+                    .get(1)
+                    .map(|m| decode_html(m.as_str()))
+                    .unwrap_or_default();
                 let title = c.get(2).map(|m| strip_html(m.as_str())).unwrap_or_default();
                 (link, title)
             }
             None => continue,
         };
-        if title.is_empty() || link.is_empty() { continue; }
-        let snippet = re_snip.as_ref()
+        if title.is_empty() || link.is_empty() {
+            continue;
+        }
+        let snippet = re_snip
+            .as_ref()
             .and_then(|re| re.captures(row))
             .and_then(|c| c.get(1))
             .map(|m| strip_html(m.as_str()))
@@ -285,12 +344,7 @@ fn parse_ddg_lite_results(html: &str, max: usize) -> Vec<(String, String, String
 
 /// 尝试 DDG 搜索（Lite 或 HTML 版），成功返回格式化文本。
 /// 使用全局 CLIENT 避免重复构建 HTTP 连接池。
-async fn try_ddg(
-    client: &reqwest::Client,
-    url: &str,
-    variant: &str,
-    max: usize,
-) -> Option<String> {
+async fn try_ddg(client: &reqwest::Client, url: &str, variant: &str, max: usize) -> Option<String> {
     let resp = client.get(url).send().await.ok()?;
     let body = resp.text().await.ok()?;
     let results = match variant {
@@ -301,12 +355,19 @@ async fn try_ddg(
     if results.is_empty() {
         return None;
     }
-    let src = if variant == "lite" { "DuckDuckGo Lite" } else { "DuckDuckGo HTML" };
+    let src = if variant == "lite" {
+        "DuckDuckGo Lite"
+    } else {
+        "DuckDuckGo HTML"
+    };
     let mut output = format!("搜索（{} 兜底）:\n\n", src);
     for (i, (title, link, snippet)) in results.iter().enumerate() {
         output.push_str(&format!(
             "{}. {}\n   {}\n   {}\n\n",
-            i + 1, title, link, snippet
+            i + 1,
+            title,
+            link,
+            snippet
         ));
     }
     Some(output)
@@ -321,26 +382,43 @@ async fn try_ddg_async(url: &str, variant: &str, max: usize) -> Option<String> {
 /// 结构: `<div class="result">` 内含 `<a class="result__a" href="URL">标题</a>` + `<a class="result__url">URL</a>` + `<div class="result__snippet">摘要</div>`
 fn parse_ddg_html_results(html: &str, max: usize) -> Vec<(String, String, String)> {
     let mut results = Vec::new();
-    let re_result = match regex::Regex::new(r#"(?s)<div[^>]*class="[^"]*\bresult\b[^"]*"[^>]*>(.*?)</div>"#) {
-        Ok(re) => re,
-        Err(_) => return results,
-    };
-    let re_link = regex::Regex::new(r#"<a[^>]*class="[^"]*\bresult__a\b[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#).ok();
-    let re_snippet = regex::Regex::new(r#"(?s)<[^>]*class="[^"]*\bresult__snippet\b[^"]*"[^>]*>(.*?)</[^>]+>"#).ok();
+    let re_result =
+        match regex::Regex::new(r#"(?s)<div[^>]*class="[^"]*\bresult\b[^"]*"[^>]*>(.*?)</div>"#) {
+            Ok(re) => re,
+            Err(_) => return results,
+        };
+    let re_link = regex::Regex::new(
+        r#"<a[^>]*class="[^"]*\bresult__a\b[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#,
+    )
+    .ok();
+    let re_snippet =
+        regex::Regex::new(r#"(?s)<[^>]*class="[^"]*\bresult__snippet\b[^"]*"[^>]*>(.*?)</[^>]+>"#)
+            .ok();
 
     for cap in re_result.captures_iter(html) {
-        if results.len() >= max { break; }
-        let block = match cap.get(1) { Some(m) => m.as_str(), None => continue };
+        if results.len() >= max {
+            break;
+        }
+        let block = match cap.get(1) {
+            Some(m) => m.as_str(),
+            None => continue,
+        };
         let (link, title) = match re_link.as_ref().and_then(|re| re.captures(block)) {
             Some(c) => {
-                let link = c.get(1).map(|m| decode_html(m.as_str())).unwrap_or_default();
+                let link = c
+                    .get(1)
+                    .map(|m| decode_html(m.as_str()))
+                    .unwrap_or_default();
                 let title = c.get(2).map(|m| strip_html(m.as_str())).unwrap_or_default();
                 (link, title)
             }
             None => continue,
         };
-        if title.is_empty() || link.is_empty() { continue; }
-        let snippet = re_snippet.as_ref()
+        if title.is_empty() || link.is_empty() {
+            continue;
+        }
+        let snippet = re_snippet
+            .as_ref()
             .and_then(|re| re.captures(block))
             .and_then(|c| c.get(1))
             .map(|m| strip_html(m.as_str()))

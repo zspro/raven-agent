@@ -3,6 +3,7 @@
 //! 核心类型的序列化、反序列化和验证测试。
 
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     use crate::*;
 

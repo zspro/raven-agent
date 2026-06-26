@@ -169,7 +169,10 @@ impl RepoMap {
         let total_files = entries.len();
         let total_symbols: usize = entries.iter().map(|e| e.symbols.len()).sum();
 
-        lines.push(format!("Repo Map: {} 文件, {} 符号", total_files, total_symbols));
+        lines.push(format!(
+            "Repo Map: {} 文件, {} 符号",
+            total_files, total_symbols
+        ));
         lines.push("─".repeat(40));
 
         for e in entries {
@@ -179,12 +182,7 @@ impl RepoMap {
             } else {
                 String::new()
             };
-            lines.push(format!(
-                "{} {}{}",
-                e.kind.icon(),
-                e.path.display(),
-                sym_str
-            ));
+            lines.push(format!("{} {}{}", e.kind.icon(), e.path.display(), sym_str));
         }
 
         lines.join("\n")
@@ -205,22 +203,19 @@ impl RepoMap {
             return;
         }
 
-        let Ok(reader) = std::fs::read_dir(current) else { return };
+        let Ok(reader) = std::fs::read_dir(current) else {
+            return;
+        };
 
         for entry in reader.filter_map(|e| e.ok()) {
             let path = entry.path();
             let name = path.file_name().unwrap_or_default().to_string_lossy();
 
             // 跳过隐藏目录和常见忽略目录
-            if name.starts_with('.')
-                && name != ".github"
-                && name != ".cargo"
-            {
+            if name.starts_with('.') && name != ".github" && name != ".cargo" {
                 continue;
             }
-            if ["target", "node_modules", "vendor", "dist", "build"]
-                .contains(&name.as_ref())
-            {
+            if ["target", "node_modules", "vendor", "dist", "build"].contains(&name.as_ref()) {
                 continue;
             }
 
@@ -285,9 +280,7 @@ impl RepoMap {
             FileKind::Rust => Self::extract_rust_symbols(content),
             FileKind::Python => Self::extract_python_symbols(content),
             FileKind::Go => Self::extract_go_symbols(content),
-            FileKind::JavaScript | FileKind::TypeScript => {
-                Self::extract_js_symbols(content)
-            }
+            FileKind::JavaScript | FileKind::TypeScript => Self::extract_js_symbols(content),
             _ => Vec::new(),
         }
     }
@@ -353,7 +346,10 @@ impl RepoMap {
         let mut symbols = Vec::new();
         let patterns = [
             (r"^\s*func\s+(?:\(.*\)\s+)?(\w+)", SymbolKind::Function),
-            (r"^\s*type\s+(\w+)\s+(?:struct|interface)", SymbolKind::Struct),
+            (
+                r"^\s*type\s+(\w+)\s+(?:struct|interface)",
+                SymbolKind::Struct,
+            ),
         ];
 
         for (i, line) in content.lines().enumerate() {
@@ -378,7 +374,10 @@ impl RepoMap {
     fn extract_js_symbols(content: &str) -> Vec<Symbol> {
         let mut symbols = Vec::new();
         let patterns = [
-            (r"^\s*(?:export\s+)?(?:async\s+)?function\s+(\w+)", SymbolKind::Function),
+            (
+                r"^\s*(?:export\s+)?(?:async\s+)?function\s+(\w+)",
+                SymbolKind::Function,
+            ),
             (r"^\s*(?:export\s+)?class\s+(\w+)", SymbolKind::Class),
             (r"^\s*const\s+(\w+)\s*=[^=]", SymbolKind::Const),
         ];

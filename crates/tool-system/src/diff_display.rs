@@ -8,10 +8,10 @@ use std::collections::VecDeque;
 /// 行差异类型
 #[derive(Debug, Clone, PartialEq)]
 pub enum DiffLine {
-    Context(String),   // 上下文行（未变更）
-    Old(String),       // 删除的行（红色）
-    New(String),       // 新增的行（绿色）
-    Hunk(String),      // hunk 头信息
+    Context(String), // 上下文行（未变更）
+    Old(String),     // 删除的行（红色）
+    New(String),     // 新增的行（绿色）
+    Hunk(String),    // hunk 头信息
 }
 
 /// 计算两组文本行的差异（Myers diff 简化版）
@@ -34,8 +34,10 @@ pub fn compute_diff(old_text: &str, new_text: &str) -> Vec<DiffLine> {
         let in_lcs = lcs_idx < lcs.len();
         let lcs_line = if in_lcs { Some(lcs[lcs_idx]) } else { None };
 
-        let old_match = old_idx < old_lines.len() && in_lcs && old_lines[old_idx] == lcs_line.unwrap();
-        let new_match = new_idx < new_lines.len() && in_lcs && new_lines[new_idx] == lcs_line.unwrap();
+        let old_match =
+            old_idx < old_lines.len() && in_lcs && old_lines[old_idx] == lcs_line.unwrap();
+        let new_match =
+            new_idx < new_lines.len() && in_lcs && new_lines[new_idx] == lcs_line.unwrap();
 
         if old_match && new_match {
             // 匹配行（上下文）
@@ -50,7 +52,10 @@ pub fn compute_diff(old_text: &str, new_text: &str) -> Vec<DiffLine> {
                 let old_start = old_idx + 1;
                 let old_count = count_consecutive_not_in_lcs(&old_lines, old_idx, &lcs, lcs_idx);
                 let new_start = new_idx + 1;
-                result.push(DiffLine::Hunk(format!("@@ -{},{} +{},{} @@", old_start, old_count, new_start, 0)));
+                result.push(DiffLine::Hunk(format!(
+                    "@@ -{},{} +{},{} @@",
+                    old_start, old_count, new_start, 0
+                )));
             }
             result.push(DiffLine::Old(old_lines[old_idx].to_string()));
             old_idx += 1;
@@ -60,7 +65,10 @@ pub fn compute_diff(old_text: &str, new_text: &str) -> Vec<DiffLine> {
                 let old_start = old_idx + 1;
                 let new_start = new_idx + 1;
                 let new_count = count_consecutive_not_in_lcs(&new_lines, new_idx, &lcs, lcs_idx);
-                result.push(DiffLine::Hunk(format!("@@ -{},{} +{},{} @@", old_start, 0, new_start, new_count)));
+                result.push(DiffLine::Hunk(format!(
+                    "@@ -{},{} +{},{} @@",
+                    old_start, 0, new_start, new_count
+                )));
             }
             result.push(DiffLine::New(new_lines[new_idx].to_string()));
             new_idx += 1;
@@ -139,12 +147,17 @@ fn longest_common_subsequence<'a>(a: &[&'a str], b: &[&'a str]) -> Vec<&'a str> 
 }
 
 /// 计算从 start 开始连续不在 LCS 中的行数
-fn count_consecutive_not_in_lcs(lines: &[&str], start: usize, lcs: &[&str], lcs_start: usize) -> usize {
+fn count_consecutive_not_in_lcs(
+    lines: &[&str],
+    start: usize,
+    lcs: &[&str],
+    lcs_start: usize,
+) -> usize {
     let mut count = 0;
     let lcs_idx = lcs_start;
 
-    for i in start..lines.len() {
-        if lcs_idx < lcs.len() && lines[i] == lcs[lcs_idx] {
+    for line in lines.iter().skip(start) {
+        if lcs_idx < lcs.len() && *line == lcs[lcs_idx] {
             break;
         }
         count += 1;
@@ -217,7 +230,7 @@ pub fn git_style_diff(old_path: &str, new_path: &str, old_text: &str, new_text: 
     let mut result = Vec::new();
 
     result.push(format!("diff --git a/{} b/{}", old_path, new_path));
-    result.push(format!("--- a/{}" , old_path));
+    result.push(format!("--- a/{}", old_path));
     result.push(format!("+++ b/{}", new_path));
 
     let diff_lines = compute_diff(old_text, new_text);

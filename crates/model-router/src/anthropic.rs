@@ -8,10 +8,13 @@
 //! - tool schema 用 `input_schema` 而非 `function.parameters`
 //! - 流式：content_block_start/delta(input_json_delta)/stop + message_delta(usage)
 
-use raven_types::{ChatResponse, Message, ModelInfo, ProviderConfig, Role, StreamEvent, TokenUsage, ToolCall, ToolCallFunction, ToolSchema};
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
+use raven_types::{
+    ChatResponse, Message, ModelInfo, ProviderConfig, Role, StreamEvent, TokenUsage, ToolCall,
+    ToolCallFunction, ToolSchema,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -92,7 +95,8 @@ impl AnthropicClient {
                     // 若上一条已是 tool_result 的 user 消息，合并（Anthropic 要求连续 tool_result 合并）
                     if let Some(last) = out.last_mut() {
                         if last["role"] == "user" {
-                            let is_tool_result = last["content"].as_array()
+                            let is_tool_result = last["content"]
+                                .as_array()
                                 .map(|arr| arr.iter().all(|b| b["type"] == "tool_result"))
                                 .unwrap_or(false);
                             if is_tool_result {
@@ -106,20 +110,35 @@ impl AnthropicClient {
             }
         }
 
-        let system = if system_parts.is_empty() { None } else { Some(system_parts.join("\n\n")) };
+        let system = if system_parts.is_empty() {
+            None
+        } else {
+            Some(system_parts.join("\n\n"))
+        };
         (system, out)
     }
 
     /// OpenAI tool schema → Anthropic tool schema
     fn convert_tools(tools: &[ToolSchema]) -> Vec<Value> {
-        tools.iter().map(|t| json!({
-            "name": t.function.name,
-            "description": t.function.description,
-            "input_schema": t.function.parameters,
-        })).collect()
+        tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "name": t.function.name,
+                    "description": t.function.description,
+                    "input_schema": t.function.parameters,
+                })
+            })
+            .collect()
     }
 
-    fn build_body(&self, model: &str, messages: &[Message], tools: Option<&[ToolSchema]>, stream: bool) -> Value {
+    fn build_body(
+        &self,
+        model: &str,
+        messages: &[Message],
+        tools: Option<&[ToolSchema]>,
+        stream: bool,
+    ) -> Value {
         let (system, msgs) = Self::convert_messages(messages);
         let mut body = json!({
             "model": model,
@@ -145,11 +164,17 @@ impl super::ProviderClient for AnthropicClient {
         &self.config.name
     }
 
-    async fn chat(&self, model: &str, messages: &[Message], tools: Option<&[ToolSchema]>) -> Result<ChatResponse, raven_types::AgentError> {
+    async fn chat(
+        &self,
+        model: &str,
+        messages: &[Message],
+        tools: Option<&[ToolSchema]>,
+    ) -> Result<ChatResponse, raven_types::AgentError> {
         let body = self.build_body(model, messages, tools, false);
         debug!("Anthropic 请求 {}, model={}", self.endpoint(), model);
 
-        let resp = self.http
+        let resp = self
+            .http
             .post(self.endpoint())
             .header("x-api-key", self.config.api_key.as_deref().unwrap_or(""))
             .header("anthropic-version", ANTHROPIC_VERSION)
@@ -157,7 +182,12 @@ impl super::ProviderClient for AnthropicClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| raven_types::AgentError::network(format!("请求失败: {}", e), "检查网络连接和 API Key"))?;
+            .map_err(|e| {
+                raven_types::AgentError::network(
+                    format!("请求失败: {}", e),
+                    "检查网络连接和 API Key",
+                )
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -168,9 +198,9 @@ impl super::ProviderClient for AnthropicClient {
             ));
         }
 
-        let api: MessagesResponse = resp.json().await.map_err(|e| raven_types::AgentError::network(
-            format!("解析响应失败: {}", e), "API 返回了非预期格式",
-        ))?;
+        let api: MessagesResponse = resp.json().await.map_err(|e| {
+            raven_types::AgentError::network(format!("解析响应失败: {}", e), "API 返回了非预期格式")
+        })?;
 
         let mut content = String::new();
         let mut tool_calls = Vec::new();
@@ -182,7 +212,10 @@ impl super::ProviderClient for AnthropicClient {
                         index: i,
                         id,
                         call_type: "function".to_string(),
-                        function: ToolCallFunction { name, arguments: input.to_string() },
+                        function: ToolCallFunction {
+                            name,
+                            arguments: input.to_string(),
+                        },
                     });
                 }
             }
@@ -202,10 +235,16 @@ impl super::ProviderClient for AnthropicClient {
         })
     }
 
-    async fn chat_stream(&self, model: &str, messages: &[Message], tools: Option<&[ToolSchema]>) -> Result<mpsc::Receiver<StreamEvent>, raven_types::AgentError> {
+    async fn chat_stream(
+        &self,
+        model: &str,
+        messages: &[Message],
+        tools: Option<&[ToolSchema]>,
+    ) -> Result<mpsc::Receiver<StreamEvent>, raven_types::AgentError> {
         let body = self.build_body(model, messages, tools, true);
 
-        let resp = self.http
+        let resp = self
+            .http
             .post(self.endpoint())
             .header("x-api-key", self.config.api_key.as_deref().unwrap_or(""))
             .header("anthropic-version", ANTHROPIC_VERSION)
@@ -213,7 +252,9 @@ impl super::ProviderClient for AnthropicClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| raven_types::AgentError::network(format!("请求失败: {}", e), "检查网络连接"))?;
+            .map_err(|e| {
+                raven_types::AgentError::network(format!("请求失败: {}", e), "检查网络连接")
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -235,63 +276,69 @@ impl super::ProviderClient for AnthropicClient {
 
             while let Some(event) = stream.next().await {
                 match event {
-                    Ok(ev) => {
-                        match serde_json::from_str::<StreamEventRaw>(&ev.data) {
-                            Ok(raw) => match raw {
-                                StreamEventRaw::MessageStart { message } => {
-                                    input_tokens = message.usage.input_tokens as usize;
+                    Ok(ev) => match serde_json::from_str::<StreamEventRaw>(&ev.data) {
+                        Ok(raw) => match raw {
+                            StreamEventRaw::MessageStart { message } => {
+                                input_tokens = message.usage.input_tokens as usize;
+                            }
+                            StreamEventRaw::ContentBlockStart {
+                                index,
+                                content_block,
+                            } => {
+                                if let ContentBlock::ToolUse { id, name, .. } = content_block {
+                                    tc_accum.insert(index, (id, name, String::new()));
                                 }
-                                StreamEventRaw::ContentBlockStart { index, content_block } => {
-                                    if let ContentBlock::ToolUse { id, name, .. } = content_block {
-                                        tc_accum.insert(index, (id, name, String::new()));
-                                    }
-                                }
-                                StreamEventRaw::ContentBlockDelta { index, delta } => match delta {
-                                    BlockDelta::TextDelta { text } => {
-                                        if !text.is_empty() {
-                                            let _ = tx.send(StreamEvent::text(text)).await;
-                                        }
-                                    }
-                                    BlockDelta::InputJsonDelta { partial_json } => {
-                                        if let Some(entry) = tc_accum.get_mut(&index) {
-                                            entry.2.push_str(&partial_json);
-                                        }
-                                    }
-                                    BlockDelta::Other => {}
-                                },
-                                StreamEventRaw::ContentBlockStop { index } => {
-                                    if let Some((id, name, mut args)) = tc_accum.remove(&index) {
-                                        if args.trim().is_empty() {
-                                            args = "{}".to_string();
-                                        }
-                                        let tc = ToolCall {
-                                            index,
-                                            id,
-                                            call_type: "function".to_string(),
-                                            function: ToolCallFunction { name, arguments: args },
-                                        };
-                                        if let Ok(j) = serde_json::to_string(&tc) {
-                                            let _ = tx.send(StreamEvent::tool_call(j)).await;
-                                        }
+                            }
+                            StreamEventRaw::ContentBlockDelta { index, delta } => match delta {
+                                BlockDelta::TextDelta { text } => {
+                                    if !text.is_empty() {
+                                        let _ = tx.send(StreamEvent::text(text)).await;
                                     }
                                 }
-                                StreamEventRaw::MessageDelta { usage, .. } => {
-                                    let _ = tx.send(StreamEvent::usage(TokenUsage {
+                                BlockDelta::InputJsonDelta { partial_json } => {
+                                    if let Some(entry) = tc_accum.get_mut(&index) {
+                                        entry.2.push_str(&partial_json);
+                                    }
+                                }
+                                BlockDelta::Other => {}
+                            },
+                            StreamEventRaw::ContentBlockStop { index } => {
+                                if let Some((id, name, mut args)) = tc_accum.remove(&index) {
+                                    if args.trim().is_empty() {
+                                        args = "{}".to_string();
+                                    }
+                                    let tc = ToolCall {
+                                        index,
+                                        id,
+                                        call_type: "function".to_string(),
+                                        function: ToolCallFunction {
+                                            name,
+                                            arguments: args,
+                                        },
+                                    };
+                                    if let Ok(j) = serde_json::to_string(&tc) {
+                                        let _ = tx.send(StreamEvent::tool_call(j)).await;
+                                    }
+                                }
+                            }
+                            StreamEventRaw::MessageDelta { usage, .. } => {
+                                let _ = tx
+                                    .send(StreamEvent::usage(TokenUsage {
                                         input: input_tokens,
                                         output: usage.output_tokens as usize,
                                         total: input_tokens + usage.output_tokens as usize,
                                         cached: None,
-                                    })).await;
-                                }
-                                StreamEventRaw::MessageStop => {
-                                    let _ = tx.send(StreamEvent::done()).await;
-                                    break;
-                                }
-                                StreamEventRaw::Other => {}
-                            },
-                            Err(e) => trace!("跳过无法解析的 Anthropic SSE: {}", e),
-                        }
-                    }
+                                    }))
+                                    .await;
+                            }
+                            StreamEventRaw::MessageStop => {
+                                let _ = tx.send(StreamEvent::done()).await;
+                                break;
+                            }
+                            StreamEventRaw::Other => {}
+                        },
+                        Err(e) => trace!("跳过无法解析的 Anthropic SSE: {}", e),
+                    },
                     Err(e) => {
                         error!("Anthropic SSE 流错误: {}", e);
                         let _ = tx.send(StreamEvent::error(e.to_string())).await;
@@ -306,14 +353,19 @@ impl super::ProviderClient for AnthropicClient {
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, raven_types::AgentError> {
         // 用配置里的模型列表回退（避免额外鉴权调用）
-        Ok(self.config.models.iter().map(|m| ModelInfo {
-            id: format!("{}/{}", self.config.name, m),
-            name: m.clone(),
-            provider: self.config.name.clone(),
-            max_tokens: 200_000,
-            supports_tools: true,
-            supports_vision: true,
-        }).collect())
+        Ok(self
+            .config
+            .models
+            .iter()
+            .map(|m| ModelInfo {
+                id: format!("{}/{}", self.config.name, m),
+                name: m.clone(),
+                provider: self.config.name.clone(),
+                max_tokens: 200_000,
+                supports_tools: true,
+                supports_vision: true,
+            })
+            .collect())
     }
 }
 
@@ -333,7 +385,9 @@ struct MessagesResponse {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ContentBlock {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -355,10 +409,20 @@ struct UsageRaw {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum StreamEventRaw {
-    MessageStart { message: MessageStartInner },
-    ContentBlockStart { index: usize, content_block: ContentBlock },
-    ContentBlockDelta { index: usize, delta: BlockDelta },
-    ContentBlockStop { index: usize },
+    MessageStart {
+        message: MessageStartInner,
+    },
+    ContentBlockStart {
+        index: usize,
+        content_block: ContentBlock,
+    },
+    ContentBlockDelta {
+        index: usize,
+        delta: BlockDelta,
+    },
+    ContentBlockStop {
+        index: usize,
+    },
     MessageDelta {
         #[allow(dead_code)]
         delta: Value,
@@ -377,8 +441,12 @@ struct MessageStartInner {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum BlockDelta {
-    TextDelta { text: String },
-    InputJsonDelta { partial_json: String },
+    TextDelta {
+        text: String,
+    },
+    InputJsonDelta {
+        partial_json: String,
+    },
     #[serde(other)]
     Other,
 }

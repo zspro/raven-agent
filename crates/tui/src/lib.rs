@@ -12,13 +12,13 @@
 //!
 //! 启动: raven tui
 
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use raven_core::Agent;
-use pulldown_cmark::{Options, Parser, Tag, TagEnd, Event};
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
-use rustyline::highlight::{Highlighter, MatchingBracketHighlighter, CmdKind};
-use rustyline::history::DefaultHistory;
+use rustyline::highlight::{CmdKind, Highlighter, MatchingBracketHighlighter};
 use rustyline::hint::{Hinter, HistoryHinter};
+use rustyline::history::DefaultHistory;
 use rustyline::validate::{MatchingBracketValidator, ValidationResult, Validator};
 use rustyline::{CompletionType, Config, Context, EditMode, Editor, Helper};
 use std::borrow::Cow;
@@ -40,18 +40,18 @@ impl ColorTheme {
     const BOLD: &'static str = "\x1b[1m";
     const ITALIC: &'static str = "\x1b[3m";
     const UNDERLINE: &'static str = "\x1b[4m";
-    const ACCENT: &'static str = "\x1b[36m";      // 青色：工具调用、引用、标题
-    const ERROR: &'static str = "\x1b[31m";       // 红色：错误
-    const SUCCESS: &'static str = "\x1b[32m";     // 绿色：成功
+    const ACCENT: &'static str = "\x1b[36m"; // 青色：工具调用、引用、标题
+    const ERROR: &'static str = "\x1b[31m"; // 红色：错误
+    const SUCCESS: &'static str = "\x1b[32m"; // 绿色：成功
     const CODE_INLINE: &'static str = "\x1b[33m"; // 黄色：行内代码
-    const BULLET: &'static str = "\x1b[33m";      // 黄色：列表符号
+    const BULLET: &'static str = "\x1b[33m"; // 黄色：列表符号
     const HEADING_H1: &'static str = "\x1b[1;36m";
     const HEADING_H2: &'static str = "\x1b[1;34m";
     const HEADING_H3: &'static str = "\x1b[1;35m";
     const QUOTE: &'static str = "\x1b[36m";
     const STRIKETHROUGH: &'static str = "\x1b[9m";
     const CODE_BG: &'static str = "\x1b[48;5;236m"; // 代码块深色背景
-    const LINK: &'static str = "\x1b[34m";         // 蓝色：链接
+    const LINK: &'static str = "\x1b[34m"; // 蓝色：链接
 }
 
 // =============================================================================
@@ -93,7 +93,9 @@ pub fn run(agent: Arc<Agent>, opening: String) -> anyhow::Result<()> {
         repl.run(opening)
     });
 
-    handle.join().map_err(|e| anyhow::anyhow!("TUI 线程 panic: {e:?}"))?
+    handle
+        .join()
+        .map_err(|e| anyhow::anyhow!("TUI 线程 panic: {e:?}"))?
 }
 
 // =============================================================================
@@ -182,7 +184,11 @@ impl Repl {
         let rx = match self.rt.block_on(self.agent.run_stream(input)) {
             Ok(rx) => rx,
             Err(e) => {
-                println!("{err}错误: {e}{rst}\n", err = ColorTheme::ERROR, rst = ColorTheme::RESET);
+                println!(
+                    "{err}错误: {e}{rst}\n",
+                    err = ColorTheme::ERROR,
+                    rst = ColorTheme::RESET
+                );
                 return;
             }
         };
@@ -245,7 +251,11 @@ impl Repl {
                         print!("{rest}");
                     }
                     let msg = event.content.unwrap_or_default();
-                    println!("{err}错误: {msg}{rst}\n", err = ColorTheme::ERROR, rst = ColorTheme::RESET);
+                    println!(
+                        "{err}错误: {msg}{rst}\n",
+                        err = ColorTheme::ERROR,
+                        rst = ColorTheme::RESET
+                    );
                     return;
                 }
                 "done" => {}
@@ -262,9 +272,17 @@ impl Repl {
         if interrupted {
             // 主动 drop 接收端，让上游 spawn 任务自然结束
             drop(rx);
-            println!("\n{dim}  (已中断){rst}", dim = ColorTheme::DIM, rst = ColorTheme::RESET);
+            println!(
+                "\n{dim}  (已中断){rst}",
+                dim = ColorTheme::DIM,
+                rst = ColorTheme::RESET
+            );
         } else if !had_text && tool_count == 0 {
-            println!("{dim}  (空回复){rst}", dim = ColorTheme::DIM, rst = ColorTheme::RESET);
+            println!(
+                "{dim}  (空回复){rst}",
+                dim = ColorTheme::DIM,
+                rst = ColorTheme::RESET
+            );
         } else {
             println!();
         }
@@ -305,8 +323,10 @@ impl Repl {
                 match self.rt.block_on(self.agent.compact()) {
                     Ok(_) => {
                         let stats = self.rt.block_on(self.agent.stats());
-                        println!("{ok}✓ 已压缩（{} in / {} out）{rst}\n",
-                            stats.total_input_tokens, stats.total_output_tokens);
+                        println!(
+                            "{ok}✓ 已压缩（{} in / {} out）{rst}\n",
+                            stats.total_input_tokens, stats.total_output_tokens
+                        );
                     }
                     Err(e) => println!("{err}✗ 压缩失败: {e}{rst}\n"),
                 }
@@ -314,10 +334,12 @@ impl Repl {
             }
             "/cost" => {
                 let stats = self.rt.block_on(self.agent.stats());
-                println!("{dim}  in: {} | out: {} | total: {}{rst}\n",
+                println!(
+                    "{dim}  in: {} | out: {} | total: {}{rst}\n",
                     stats.total_input_tokens,
                     stats.total_output_tokens,
-                    stats.total_input_tokens + stats.total_output_tokens);
+                    stats.total_input_tokens + stats.total_output_tokens
+                );
                 false
             }
             "/help" => {
@@ -352,12 +374,7 @@ impl Repl {
             "    {  \"  }   ",
             "  ---\"-\"---   ",
         ];
-        let tag = [
-            "",
-            "Raven 🐦‍⬛",
-            "Think like a raven.",
-            "Code like the wind.",
-        ];
+        let tag = ["", "Raven 🐦‍⬛", "Think like a raven.", "Code like the wind."];
         println!();
         for (a, t) in art.iter().zip(tag.iter()) {
             if t.is_empty() {
@@ -414,7 +431,9 @@ fn preprocess_standalone_commands(text: &str) -> String {
             if next.is_alphabetic() {
                 let cmd_start = i + 1;
                 let mut j = cmd_start;
-                while j < chars.len() && chars[j].is_alphabetic() { j += 1; }
+                while j < chars.len() && chars[j].is_alphabetic() {
+                    j += 1;
+                }
                 let cmd: String = chars[cmd_start..j].iter().collect();
 
                 match cmd.as_str() {
@@ -435,9 +454,15 @@ fn preprocess_standalone_commands(text: &str) -> String {
                             let mut depth = 1u32;
                             let mut k = j + 1;
                             while k < chars.len() && depth > 0 {
-                                if chars[k] == '{' { depth += 1; }
-                                if chars[k] == '}' { depth -= 1; }
-                                if depth > 0 { k += 1; }
+                                if chars[k] == '{' {
+                                    depth += 1;
+                                }
+                                if chars[k] == '}' {
+                                    depth -= 1;
+                                }
+                                if depth > 0 {
+                                    k += 1;
+                                }
                             }
                             let inner: String = chars[j + 1..k].iter().collect();
                             // 递归处理内部内容
@@ -455,9 +480,15 @@ fn preprocess_standalone_commands(text: &str) -> String {
                             let mut depth = 1u32;
                             let mut k = j + 1;
                             while k < chars.len() && depth > 0 {
-                                if chars[k] == '{' { depth += 1; }
-                                if chars[k] == '}' { depth -= 1; }
-                                if depth > 0 { k += 1; }
+                                if chars[k] == '{' {
+                                    depth += 1;
+                                }
+                                if chars[k] == '}' {
+                                    depth -= 1;
+                                }
+                                if depth > 0 {
+                                    k += 1;
+                                }
                             }
                             let inner: String = chars[j + 1..k].iter().collect();
                             let processed = preprocess_standalone_commands(&inner);
@@ -493,10 +524,10 @@ fn preprocess_html_sub_sup(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if i + 5 <= bytes.len() && &bytes[i..i+5] == b"<sub>" {
+        if i + 5 <= bytes.len() && &bytes[i..i + 5] == b"<sub>" {
             i += 5;
             let start = i;
-            while i + 6 <= bytes.len() && &bytes[i..i+6] != b"</sub>" {
+            while i + 6 <= bytes.len() && &bytes[i..i + 6] != b"</sub>" {
                 i += 1;
             }
             let content = std::str::from_utf8(&bytes[start..i]).unwrap_or("");
@@ -505,11 +536,13 @@ fn preprocess_html_sub_sup(text: &str) -> String {
             } else {
                 out.push_str(&format!("_({content})"));
             }
-            if i + 6 <= bytes.len() { i += 6; }
-        } else if i + 5 <= bytes.len() && &bytes[i..i+5] == b"<sup>" {
+            if i + 6 <= bytes.len() {
+                i += 6;
+            }
+        } else if i + 5 <= bytes.len() && &bytes[i..i + 5] == b"<sup>" {
             i += 5;
             let start = i;
-            while i + 6 <= bytes.len() && &bytes[i..i+6] != b"</sup>" {
+            while i + 6 <= bytes.len() && &bytes[i..i + 6] != b"</sup>" {
                 i += 1;
             }
             let content = std::str::from_utf8(&bytes[start..i]).unwrap_or("");
@@ -518,7 +551,9 @@ fn preprocess_html_sub_sup(text: &str) -> String {
             } else {
                 out.push_str(&format!("^({content})"));
             }
-            if i + 6 <= bytes.len() { i += 6; }
+            if i + 6 <= bytes.len() {
+                i += 6;
+            }
         } else {
             let ch = text[i..].chars().next().unwrap_or('\0');
             out.push(ch);
@@ -537,7 +572,7 @@ fn preprocess_latex_math(text: &str) -> String {
 
     while i < len {
         // 检测 \[ 块 (LaTeX display math)
-        if i + 2 <= len && &bytes[i..i+2] == b"\\[" {
+        if i + 2 <= len && &bytes[i..i + 2] == b"\\[" {
             let start = i + 2;
             if let Some(end) = text[start..].find("\\]") {
                 let math = &text[start..start + end];
@@ -547,7 +582,7 @@ fn preprocess_latex_math(text: &str) -> String {
             }
         }
         // 检测 \( 行内 (LaTeX inline math)
-        if i + 2 <= len && &bytes[i..i+2] == b"\\(" {
+        if i + 2 <= len && &bytes[i..i + 2] == b"\\(" {
             let start = i + 2;
             if let Some(end) = text[start..].find("\\)") {
                 let math = &text[start..start + end];
@@ -557,7 +592,7 @@ fn preprocess_latex_math(text: &str) -> String {
             }
         }
         // 检测 $$ 块
-        if i + 2 <= len && &bytes[i..i+2] == b"$$" {
+        if i + 2 <= len && &bytes[i..i + 2] == b"$$" {
             // 跳过 `$$` 分隔符，找到匹配的 `$$`
             let start = i + 2;
             if let Some(end) = text[start..].find("$$") {
@@ -649,7 +684,9 @@ fn latex_to_unicode(math: &str) -> String {
             '\\' => {
                 i += 1;
                 let cmd_start = i;
-                while i < chars.len() && chars[i].is_alphabetic() { i += 1; }
+                while i < chars.len() && chars[i].is_alphabetic() {
+                    i += 1;
+                }
                 let cmd: String = chars[cmd_start..i].iter().collect();
 
                 // 空命令（\; \, \: \! \ 等）→ 空格
@@ -751,8 +788,11 @@ fn latex_to_unicode(math: &str) -> String {
                             if i < chars.len() && chars[i] == '{' {
                                 i += 1;
                                 let den = extract_brace_group(&chars, &mut i);
-                                out.push_str(&format!("({})/({})",
-                                    latex_to_unicode(&num), latex_to_unicode(&den)));
+                                out.push_str(&format!(
+                                    "({})/({})",
+                                    latex_to_unicode(&num),
+                                    latex_to_unicode(&den)
+                                ));
                                 i += 1;
                             } else {
                                 out.push_str(&latex_to_unicode(&num));
@@ -764,7 +804,7 @@ fn latex_to_unicode(math: &str) -> String {
                     // 空格类
                     "quad" | "qquad" => out.push(' '),
                     // 无操作（忽略）
-                    "displaystyle" | "textstyle" | "scriptstyle" => {},
+                    "displaystyle" | "textstyle" | "scriptstyle" => {}
                     // \boxed{...} → 提取内容（数学模式内）
                     "boxed" => {
                         if i < chars.len() && chars[i] == '{' {
@@ -782,7 +822,9 @@ fn latex_to_unicode(math: &str) -> String {
                 }
             }
             // 花括号 — 数学模式中裸花括号跳过（已由分数/文本等处理）
-            '{' | '}' => { i += 1; }
+            '{' | '}' => {
+                i += 1;
+            }
             // 其他字符
             _ => {
                 out.push(c);
@@ -799,67 +841,195 @@ fn extract_brace_group(chars: &[char], i: &mut usize) -> String {
     let start = *i;
     let mut depth = 1usize;
     while *i < chars.len() && depth > 0 {
-        if chars[*i] == '{' { depth += 1; }
-        if chars[*i] == '}' { depth -= 1; }
-        if depth > 0 { *i += 1; }
+        if chars[*i] == '{' {
+            depth += 1;
+        }
+        if chars[*i] == '}' {
+            depth -= 1;
+        }
+        if depth > 0 {
+            *i += 1;
+        }
     }
     chars[start..*i].iter().collect()
 }
 
 fn sub_to_unicode(s: &str) -> String {
-    s.chars().map(|c| match c {
-        '0' => '₀','1' => '₁','2' => '₂','3' => '₃','4' => '₄',
-        '5' => '₅','6' => '₆','7' => '₇','8' => '₈','9' => '₉',
-        'a' => 'ₐ','e' => 'ₑ','h' => 'ₕ','i' => 'ᵢ','j' => 'ⱼ',
-        'k' => 'ₖ','l' => 'ₗ','m' => 'ₘ','n' => 'ₙ','o' => 'ₒ',
-        'p' => 'ₚ','r' => 'ᵣ','s' => 'ₛ','t' => 'ₜ','u' => 'ᵤ',
-        'v' => 'ᵥ','x' => 'ₓ',
-        '+' => '₊','-' => '₋','=' => '₌','(' => '₍',')' => '₎',
-        _ => c,
-    }).collect()
+    s.chars()
+        .map(|c| match c {
+            '0' => '₀',
+            '1' => '₁',
+            '2' => '₂',
+            '3' => '₃',
+            '4' => '₄',
+            '5' => '₅',
+            '6' => '₆',
+            '7' => '₇',
+            '8' => '₈',
+            '9' => '₉',
+            'a' => 'ₐ',
+            'e' => 'ₑ',
+            'h' => 'ₕ',
+            'i' => 'ᵢ',
+            'j' => 'ⱼ',
+            'k' => 'ₖ',
+            'l' => 'ₗ',
+            'm' => 'ₘ',
+            'n' => 'ₙ',
+            'o' => 'ₒ',
+            'p' => 'ₚ',
+            'r' => 'ᵣ',
+            's' => 'ₛ',
+            't' => 'ₜ',
+            'u' => 'ᵤ',
+            'v' => 'ᵥ',
+            'x' => 'ₓ',
+            '+' => '₊',
+            '-' => '₋',
+            '=' => '₌',
+            '(' => '₍',
+            ')' => '₎',
+            _ => c,
+        })
+        .collect()
 }
 
 fn sup_to_unicode(s: &str) -> String {
-    s.chars().map(|c| match c {
-        '0' => '⁰','1' => '¹','2' => '²','3' => '³','4' => '⁴',
-        '5' => '⁵','6' => '⁶','7' => '⁷','8' => '⁸','9' => '⁹',
-        'a' => 'ᵃ','b' => 'ᵇ','c' => 'ᶜ','d' => 'ᵈ','e' => 'ᵉ',
-        'f' => 'ᶠ','g' => 'ᵍ','h' => 'ʰ','i' => 'ⁱ','j' => 'ʲ',
-        'k' => 'ᵏ','l' => 'ˡ','m' => 'ᵐ','n' => 'ⁿ','o' => 'ᵒ',
-        'p' => 'ᵖ','r' => 'ʳ','s' => 'ˢ','t' => 'ᵗ','u' => 'ᵘ',
-        'v' => 'ᵛ','w' => 'ʷ','x' => 'ˣ','y' => 'ʸ','z' => 'ᶻ',
-        '+' => '⁺','-' => '⁻','=' => '⁼','(' => '⁽',')' => '⁾',
-        _ => c,
-    }).collect()
+    s.chars()
+        .map(|c| match c {
+            '0' => '⁰',
+            '1' => '¹',
+            '2' => '²',
+            '3' => '³',
+            '4' => '⁴',
+            '5' => '⁵',
+            '6' => '⁶',
+            '7' => '⁷',
+            '8' => '⁸',
+            '9' => '⁹',
+            'a' => 'ᵃ',
+            'b' => 'ᵇ',
+            'c' => 'ᶜ',
+            'd' => 'ᵈ',
+            'e' => 'ᵉ',
+            'f' => 'ᶠ',
+            'g' => 'ᵍ',
+            'h' => 'ʰ',
+            'i' => 'ⁱ',
+            'j' => 'ʲ',
+            'k' => 'ᵏ',
+            'l' => 'ˡ',
+            'm' => 'ᵐ',
+            'n' => 'ⁿ',
+            'o' => 'ᵒ',
+            'p' => 'ᵖ',
+            'r' => 'ʳ',
+            's' => 'ˢ',
+            't' => 'ᵗ',
+            'u' => 'ᵘ',
+            'v' => 'ᵛ',
+            'w' => 'ʷ',
+            'x' => 'ˣ',
+            'y' => 'ʸ',
+            'z' => 'ᶻ',
+            '+' => '⁺',
+            '-' => '⁻',
+            '=' => '⁼',
+            '(' => '⁽',
+            ')' => '⁾',
+            _ => c,
+        })
+        .collect()
 }
 
 /// 字符串中所有字符是否均可转为下标/上标
-fn all_subscriptable(s: &str) -> bool { s.chars().all(|c| sub_to_unicode_char(c) != c || c == ' ') }
-fn all_superscriptable(s: &str) -> bool { s.chars().all(|c| sup_to_unicode_char(c) != c || c == ' ') }
+fn all_subscriptable(s: &str) -> bool {
+    s.chars().all(|c| sub_to_unicode_char(c) != c || c == ' ')
+}
+fn all_superscriptable(s: &str) -> bool {
+    s.chars().all(|c| sup_to_unicode_char(c) != c || c == ' ')
+}
 
 fn sub_to_unicode_char(c: char) -> char {
     match c {
-        '0' => '₀','1' => '₁','2' => '₂','3' => '₃','4' => '₄',
-        '5' => '₅','6' => '₆','7' => '₇','8' => '₈','9' => '₉',
-        'a' => 'ₐ','e' => 'ₑ','h' => 'ₕ','i' => 'ᵢ','j' => 'ⱼ',
-        'k' => 'ₖ','l' => 'ₗ','m' => 'ₘ','n' => 'ₙ','o' => 'ₒ',
-        'p' => 'ₚ','r' => 'ᵣ','s' => 'ₛ','t' => 'ₜ','u' => 'ᵤ',
-        'v' => 'ᵥ','x' => 'ₓ',
-        '+' => '₊','-' => '₋','=' => '₌','(' => '₍',')' => '₎',
+        '0' => '₀',
+        '1' => '₁',
+        '2' => '₂',
+        '3' => '₃',
+        '4' => '₄',
+        '5' => '₅',
+        '6' => '₆',
+        '7' => '₇',
+        '8' => '₈',
+        '9' => '₉',
+        'a' => 'ₐ',
+        'e' => 'ₑ',
+        'h' => 'ₕ',
+        'i' => 'ᵢ',
+        'j' => 'ⱼ',
+        'k' => 'ₖ',
+        'l' => 'ₗ',
+        'm' => 'ₘ',
+        'n' => 'ₙ',
+        'o' => 'ₒ',
+        'p' => 'ₚ',
+        'r' => 'ᵣ',
+        's' => 'ₛ',
+        't' => 'ₜ',
+        'u' => 'ᵤ',
+        'v' => 'ᵥ',
+        'x' => 'ₓ',
+        '+' => '₊',
+        '-' => '₋',
+        '=' => '₌',
+        '(' => '₍',
+        ')' => '₎',
         _ => c,
     }
 }
 
 fn sup_to_unicode_char(c: char) -> char {
     match c {
-        '0' => '⁰','1' => '¹','2' => '²','3' => '³','4' => '⁴',
-        '5' => '⁵','6' => '⁶','7' => '⁷','8' => '⁸','9' => '⁹',
-        'a' => 'ᵃ','b' => 'ᵇ','c' => 'ᶜ','d' => 'ᵈ','e' => 'ᵉ',
-        'f' => 'ᶠ','g' => 'ᵍ','h' => 'ʰ','i' => 'ⁱ','j' => 'ʲ',
-        'k' => 'ᵏ','l' => 'ˡ','m' => 'ᵐ','n' => 'ⁿ','o' => 'ᵒ',
-        'p' => 'ᵖ','r' => 'ʳ','s' => 'ˢ','t' => 'ᵗ','u' => 'ᵘ',
-        'v' => 'ᵛ','w' => 'ʷ','x' => 'ˣ','y' => 'ʸ','z' => 'ᶻ',
-        '+' => '⁺','-' => '⁻','=' => '⁼','(' => '⁽',')' => '⁾',
+        '0' => '⁰',
+        '1' => '¹',
+        '2' => '²',
+        '3' => '³',
+        '4' => '⁴',
+        '5' => '⁵',
+        '6' => '⁶',
+        '7' => '⁷',
+        '8' => '⁸',
+        '9' => '⁹',
+        'a' => 'ᵃ',
+        'b' => 'ᵇ',
+        'c' => 'ᶜ',
+        'd' => 'ᵈ',
+        'e' => 'ᵉ',
+        'f' => 'ᶠ',
+        'g' => 'ᵍ',
+        'h' => 'ʰ',
+        'i' => 'ⁱ',
+        'j' => 'ʲ',
+        'k' => 'ᵏ',
+        'l' => 'ˡ',
+        'm' => 'ᵐ',
+        'n' => 'ⁿ',
+        'o' => 'ᵒ',
+        'p' => 'ᵖ',
+        'r' => 'ʳ',
+        's' => 'ˢ',
+        't' => 'ᵗ',
+        'u' => 'ᵘ',
+        'v' => 'ᵛ',
+        'w' => 'ʷ',
+        'x' => 'ˣ',
+        'y' => 'ʸ',
+        'z' => 'ᶻ',
+        '+' => '⁺',
+        '-' => '⁻',
+        '=' => '⁼',
+        '(' => '⁽',
+        ')' => '⁾',
         _ => c,
     }
 }
@@ -946,7 +1116,11 @@ impl Renderer {
                         continue;
                     }
                     Event::Code(c) => {
-                        table_cur_cell.push_str(&format!("{}`{c}`{}", ColorTheme::CODE_INLINE, ColorTheme::RESET));
+                        table_cur_cell.push_str(&format!(
+                            "{}`{c}`{}",
+                            ColorTheme::CODE_INLINE,
+                            ColorTheme::RESET
+                        ));
                         continue;
                     }
                     Event::Start(Tag::Emphasis) => {
@@ -1019,7 +1193,9 @@ impl Renderer {
                 Event::End(TagEnd::Emphasis) => {
                     style_stack.retain(|&s| s != ColorTheme::ITALIC);
                     out.push_str(ColorTheme::RESET);
-                    for &s in &style_stack { out.push_str(s); }
+                    for &s in &style_stack {
+                        out.push_str(s);
+                    }
                 }
                 Event::Start(Tag::Strong) => {
                     style_stack.push(ColorTheme::BOLD);
@@ -1028,9 +1204,15 @@ impl Renderer {
                 Event::End(TagEnd::Strong) => {
                     style_stack.retain(|&s| s != ColorTheme::BOLD);
                     out.push_str(ColorTheme::RESET);
-                    for &s in &style_stack { out.push_str(s); }
+                    for &s in &style_stack {
+                        out.push_str(s);
+                    }
                 }
-                Event::Code(c) => out.push_str(&format!("{}`{c}`{}", ColorTheme::CODE_INLINE, ColorTheme::RESET)),
+                Event::Code(c) => out.push_str(&format!(
+                    "{}`{c}`{}",
+                    ColorTheme::CODE_INLINE,
+                    ColorTheme::RESET
+                )),
                 Event::Start(Tag::Strikethrough) => {
                     style_stack.push(ColorTheme::STRIKETHROUGH);
                     out.push_str(ColorTheme::STRIKETHROUGH);
@@ -1038,7 +1220,9 @@ impl Renderer {
                 Event::End(TagEnd::Strikethrough) => {
                     style_stack.retain(|&s| s != ColorTheme::STRIKETHROUGH);
                     out.push_str(ColorTheme::RESET);
-                    for &s in &style_stack { out.push_str(s); }
+                    for &s in &style_stack {
+                        out.push_str(s);
+                    }
                 }
 
                 // ---- 引用 ----
@@ -1056,9 +1240,16 @@ impl Renderer {
                 Event::End(TagEnd::Link) => {
                     style_stack.retain(|&s| s != ColorTheme::LINK && s != ColorTheme::UNDERLINE);
                     out.push_str(ColorTheme::RESET);
-                    for &s in &style_stack { out.push_str(s); }
+                    for &s in &style_stack {
+                        out.push_str(s);
+                    }
                     // 链接后附 URL
-                    out.push_str(&format!("{} ({}){}", ColorTheme::DIM, link_url, ColorTheme::RESET));
+                    out.push_str(&format!(
+                        "{} ({}){}",
+                        ColorTheme::DIM,
+                        link_url,
+                        ColorTheme::RESET
+                    ));
                     link_url.clear();
                 }
 
@@ -1145,7 +1336,7 @@ impl Renderer {
         let mut out = String::new();
         out.push('\n');
 
-        let is_header = rows.len() >= 1;
+        let is_header = !rows.is_empty();
 
         for (ri, row) in rows.iter().enumerate() {
             let is_hdr = ri == 0 && is_header;
@@ -1174,7 +1365,11 @@ impl Renderer {
                     ));
                 }
             }
-            out.push_str(&format!("{dim}│{rst}\n", dim = ColorTheme::DIM, rst = ColorTheme::RESET));
+            out.push_str(&format!(
+                "{dim}│{rst}\n",
+                dim = ColorTheme::DIM,
+                rst = ColorTheme::RESET
+            ));
 
             // 表头分隔线
             if is_hdr {
@@ -1210,7 +1405,12 @@ impl Renderer {
                 Ok(ranges) => {
                     let styled: String = ranges
                         .iter()
-                        .map(|(s, t)| format!("\x1b[38;2;{};{};{}m{bg}{t}", s.foreground.r, s.foreground.g, s.foreground.b))
+                        .map(|(s, t)| {
+                            format!(
+                                "\x1b[38;2;{};{};{}m{bg}{t}",
+                                s.foreground.r, s.foreground.g, s.foreground.b
+                            )
+                        })
                         .collect();
                     out.push_str(&format!("{dim}│{rst} {styled}{rst}\n"));
                 }
@@ -1278,7 +1478,11 @@ fn char_display_width(c: char) -> usize {
         0x1F300..=0x1FAFF | // emoji 及符号
         0x20000..=0x3FFFD   // CJK 扩展 B 及以上
     );
-    if wide { 2 } else { 1 }
+    if wide {
+        2
+    } else {
+        1
+    }
 }
 
 fn spacer(n: usize) -> String {
@@ -1290,7 +1494,9 @@ fn table_border_top(widths: &[usize]) -> String {
     s.push('┌');
     for (i, w) in widths.iter().enumerate() {
         s.push_str(&"─".repeat(w + 2));
-        if i + 1 < widths.len() { s.push('┬'); }
+        if i + 1 < widths.len() {
+            s.push('┬');
+        }
     }
     s.push('┐');
     s.push_str(ColorTheme::RESET);
@@ -1303,7 +1509,9 @@ fn table_border_sep(widths: &[usize]) -> String {
     s.push('├');
     for (i, w) in widths.iter().enumerate() {
         s.push_str(&"─".repeat(w + 2));
-        if i + 1 < widths.len() { s.push('┼'); }
+        if i + 1 < widths.len() {
+            s.push('┼');
+        }
     }
     s.push('┤');
     s.push_str(ColorTheme::RESET);
@@ -1316,7 +1524,9 @@ fn table_border_bottom(widths: &[usize]) -> String {
     s.push('└');
     for (i, w) in widths.iter().enumerate() {
         s.push_str(&"─".repeat(w + 2));
-        if i + 1 < widths.len() { s.push('┴'); }
+        if i + 1 < widths.len() {
+            s.push('┴');
+        }
     }
     s.push('┘');
     s.push_str(ColorTheme::RESET);
@@ -1351,13 +1561,23 @@ impl Helper for ReplHelper {}
 impl Completer for ReplHelper {
     type Candidate = Pair;
 
-    fn complete(&self, line: &str, pos: usize, _: &Context<'_>) -> Result<(usize, Vec<Pair>), ReadlineError> {
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _: &Context<'_>,
+    ) -> Result<(usize, Vec<Pair>), ReadlineError> {
         if !line.starts_with('/') {
             return Ok((0, vec![]));
         }
-        let matches = self.commands.iter()
+        let matches = self
+            .commands
+            .iter()
             .filter(|c| c.starts_with(&line[..pos]))
-            .map(|c| Pair { display: c.to_string(), replacement: format!("{c} ") })
+            .map(|c| Pair {
+                display: c.to_string(),
+                replacement: format!("{c} "),
+            })
             .collect();
         Ok((0, matches))
     }
@@ -1383,7 +1603,10 @@ impl Highlighter for ReplHelper {
 }
 
 impl Validator for ReplHelper {
-    fn validate(&self, ctx: &mut rustyline::validate::ValidationContext) -> Result<ValidationResult, ReadlineError> {
+    fn validate(
+        &self,
+        ctx: &mut rustyline::validate::ValidationContext,
+    ) -> Result<ValidationResult, ReadlineError> {
         self.validator.validate(ctx)
     }
     fn validate_while_typing(&self) -> bool {
@@ -1407,7 +1630,9 @@ struct MarkdownStreamState {
 
 impl MarkdownStreamState {
     fn new() -> Self {
-        Self { pending: String::new() }
+        Self {
+            pending: String::new(),
+        }
     }
 
     /// 追加增量，返回本次可安全输出的已渲染 ANSI（可能为空）
@@ -1447,11 +1672,17 @@ fn parse_fence_opener(line: &str) -> Option<FenceMarker> {
         return None;
     }
     // 围栏后面只能是空白或语言标识符（不能跟同字符）
-    let after: String = trimmed[count..].chars().take_while(|&c| c != '\n' && c != '\r').collect();
+    let after: String = trimmed[count..]
+        .chars()
+        .take_while(|&c| c != '\n' && c != '\r')
+        .collect();
     if after.chars().any(|c| c == ch) {
         return None; // 混杂字符，不是纯围栏
     }
-    Some(FenceMarker { character: ch, length: count })
+    Some(FenceMarker {
+        character: ch,
+        length: count,
+    })
 }
 
 /// 检测嵌套代码围栏并自动扩展外层围栏。
@@ -1467,7 +1698,9 @@ fn normalize_nested_fences(text: &str) -> String {
     for (i, line) in lines.iter().enumerate() {
         if let Some(fm) = parse_fence_opener(line) {
             // 判断是开还是关：寻找栈顶匹配的
-            let is_close = fences.iter().rev().any(|(_, f, is_open)| *is_open && f.character == fm.character && f.length == fm.length);
+            let is_close = fences.iter().rev().any(|(_, f, is_open)| {
+                *is_open && f.character == fm.character && f.length == fm.length
+            });
             fences.push((i, fm, !is_close));
         }
     }
@@ -1508,8 +1741,8 @@ fn normalize_nested_fences(text: &str) -> String {
                 result.push('\n');
             }
             // 替换围栏行
-            let old_fence: String = std::iter::repeat(fm.character).take(fm.length).collect();
-            let new_fence: String = std::iter::repeat(fm.character).take(new_len).collect();
+            let old_fence: String = std::iter::repeat_n(fm.character, fm.length).collect();
+            let new_fence: String = std::iter::repeat_n(fm.character, new_len).collect();
             let line = lines[*li].replacen(&old_fence, &new_fence, 1);
             result.push_str(&line);
             result.push('\n');
@@ -1605,13 +1838,28 @@ fn render_tool_call(name: &str, args: &str, spin_idx: u32) -> String {
     let spin = spinner_frame(spin_idx);
     let icon = tool_icon(name);
     if brief.is_empty() {
-        format!("\n{accent}{spin}{rst} {icon} {bold}{name}{rst} {dim}(no args){rst}\n",
-            accent = ColorTheme::ACCENT, spin = spin, rst = ColorTheme::RESET,
-            bold = ColorTheme::BOLD, dim = ColorTheme::DIM, icon = icon, name = name)
+        format!(
+            "\n{accent}{spin}{rst} {icon} {bold}{name}{rst} {dim}(no args){rst}\n",
+            accent = ColorTheme::ACCENT,
+            spin = spin,
+            rst = ColorTheme::RESET,
+            bold = ColorTheme::BOLD,
+            dim = ColorTheme::DIM,
+            icon = icon,
+            name = name
+        )
     } else {
-        format!("\n{accent}{spin}{rst} {icon} {bold}{name}{rst} {dim}{brief}{rst}\n",
-            accent = ColorTheme::ACCENT, spin = spin, rst = ColorTheme::RESET,
-            bold = ColorTheme::BOLD, dim = ColorTheme::DIM, icon = icon, name = name, brief = brief)
+        format!(
+            "\n{accent}{spin}{rst} {icon} {bold}{name}{rst} {dim}{brief}{rst}\n",
+            accent = ColorTheme::ACCENT,
+            spin = spin,
+            rst = ColorTheme::RESET,
+            bold = ColorTheme::BOLD,
+            dim = ColorTheme::DIM,
+            icon = icon,
+            name = name,
+            brief = brief
+        )
     }
 }
 
@@ -1621,7 +1869,12 @@ fn render_tool_result(_name: &str, output: &str, is_error: bool) -> String {
     let dim = ColorTheme::DIM;
     let rst = ColorTheme::RESET;
     if is_error {
-        format!("  {err}✗{rst} {dim}{preview}{rst}\n", err = ColorTheme::ERROR, rst = rst, dim = dim)
+        format!(
+            "  {err}✗{rst} {dim}{preview}{rst}\n",
+            err = ColorTheme::ERROR,
+            rst = rst,
+            dim = dim
+        )
     } else {
         let mut out = String::new();
         let mut lines = preview.lines();
@@ -1645,13 +1898,16 @@ fn brief_args(args: &str) -> String {
     }
     let compact = match serde_json::from_str::<serde_json::Value>(trimmed) {
         Ok(serde_json::Value::Object(map)) => {
-            let parts: Vec<String> = map.iter().map(|(k, v)| {
-                let vs = match v {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                format!("{k}={vs}")
-            }).collect();
+            let parts: Vec<String> = map
+                .iter()
+                .map(|(k, v)| {
+                    let vs = match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    format!("{k}={vs}")
+                })
+                .collect();
             parts.join(" ")
         }
         _ => trimmed.to_string(),

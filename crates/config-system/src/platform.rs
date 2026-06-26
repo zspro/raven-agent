@@ -65,7 +65,9 @@ impl Platform {
                 // Android Termux: $HOME/.raven
                 dirs::home_dir()
                     .map(|h| h.join(".raven"))
-                    .unwrap_or_else(|| std::path::PathBuf::from("/data/data/com.termux/files/home/.raven"))
+                    .unwrap_or_else(|| {
+                        std::path::PathBuf::from("/data/data/com.termux/files/home/.raven")
+                    })
             }
             _ => {
                 // Linux / macOS: ~/.raven

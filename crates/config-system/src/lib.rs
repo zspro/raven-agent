@@ -4,8 +4,8 @@
 //! 吸取 OpenClaw 的教训：配置项不要过多，验证要在加载时就做。
 
 pub mod hot_reload;
-pub mod prompts;
 pub mod platform;
+pub mod prompts;
 
 #[cfg(test)]
 mod tests;
@@ -80,30 +80,25 @@ impl ConfigSystem {
 
     /// 保存配置到指定路径
     pub fn save_to(&self, path: &std::path::Path) -> Result<(), String> {
-        let content = toml::to_string_pretty(&self.config)
-            .map_err(|e| format!("序列化失败: {}", e))?;
-        std::fs::write(path, content)
-            .map_err(|e| format!("写入失败: {}", e))?;
+        let content =
+            toml::to_string_pretty(&self.config).map_err(|e| format!("序列化失败: {}", e))?;
+        std::fs::write(path, content).map_err(|e| format!("写入失败: {}", e))?;
         Ok(())
     }
 
     /// 保存配置到默认路径 (~/.raven/config.toml)
     pub fn save(&self) -> Result<(), String> {
-        let home = dirs::home_dir()
-            .ok_or("无法获取家目录")?;
+        let home = dirs::home_dir().ok_or("无法获取家目录")?;
         let dir = home.join(".raven");
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("创建目录失败: {}", e))?;
+        std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {}", e))?;
         self.save_to(&dir.join("config.toml"))
     }
 
     /// 从文件加载配置
     fn load_file(&mut self, path: &PathBuf) -> Result<(), String> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("读取失败: {}", e))?;
+        let content = std::fs::read_to_string(path).map_err(|e| format!("读取失败: {}", e))?;
 
-        let file_cfg: Config = toml::from_str(&content)
-            .map_err(|e| format!("解析失败: {}", e))?;
+        let file_cfg: Config = toml::from_str(&content).map_err(|e| format!("解析失败: {}", e))?;
 
         self.merge(file_cfg);
         debug!("已加载配置: {}", path.display());

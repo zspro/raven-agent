@@ -79,7 +79,11 @@ impl Message {
         }
     }
 
-    pub fn tool_result(call_id: impl Into<String>, name: impl Into<String>, content: impl Into<String>) -> Self {
+    pub fn tool_result(
+        call_id: impl Into<String>,
+        name: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
         Self {
             role: Role::Tool,
             content: content.into(),
@@ -93,10 +97,11 @@ impl Message {
     pub fn estimate_tokens(&self) -> usize {
         estimate_tokens(&self.content)
             + self.tool_calls.as_ref().map_or(0, |tc| {
-                tc.iter().map(|t| {
-                    estimate_tokens(&t.function.name)
-                        + estimate_tokens(&t.function.arguments)
-                }).sum()
+                tc.iter()
+                    .map(|t| {
+                        estimate_tokens(&t.function.name) + estimate_tokens(&t.function.arguments)
+                    })
+                    .sum()
             })
     }
 }
@@ -233,22 +238,46 @@ pub struct StreamEvent {
 
 impl StreamEvent {
     pub fn text(content: impl Into<String>) -> Self {
-        Self { event_type: "text".to_string(), content: Some(content.into()), usage: None }
+        Self {
+            event_type: "text".to_string(),
+            content: Some(content.into()),
+            usage: None,
+        }
     }
     pub fn tool_call(content: impl Into<String>) -> Self {
-        Self { event_type: "tool_call".to_string(), content: Some(content.into()), usage: None }
+        Self {
+            event_type: "tool_call".to_string(),
+            content: Some(content.into()),
+            usage: None,
+        }
     }
     pub fn tool_result(content: impl Into<String>) -> Self {
-        Self { event_type: "tool_result".to_string(), content: Some(content.into()), usage: None }
+        Self {
+            event_type: "tool_result".to_string(),
+            content: Some(content.into()),
+            usage: None,
+        }
     }
     pub fn usage(u: TokenUsage) -> Self {
-        Self { event_type: "usage".to_string(), content: None, usage: Some(u) }
+        Self {
+            event_type: "usage".to_string(),
+            content: None,
+            usage: Some(u),
+        }
     }
     pub fn done() -> Self {
-        Self { event_type: "done".to_string(), content: None, usage: None }
+        Self {
+            event_type: "done".to_string(),
+            content: None,
+            usage: None,
+        }
     }
     pub fn error(content: impl Into<String>) -> Self {
-        Self { event_type: "error".to_string(), content: Some(content.into()), usage: None }
+        Self {
+            event_type: "error".to_string(),
+            content: Some(content.into()),
+            usage: None,
+        }
     }
 }
 
@@ -642,7 +671,10 @@ impl AgentError {
         let tool = tool.into();
         Self::Permission {
             message: format!("工具 '{}' 未被授权", tool),
-            fix: format!("在配置中 '{}.allowed_tools' 添加 '{}' 或切换到 'yes' 模式", tool, tool),
+            fix: format!(
+                "在配置中 '{}.allowed_tools' 添加 '{}' 或切换到 'yes' 模式",
+                tool, tool
+            ),
         }
     }
 
@@ -665,15 +697,13 @@ pub fn estimate_tokens(text: &str) -> usize {
         return 0;
     }
 
-    let (chinese, other) = text
-        .chars()
-        .fold((0, 0), |(c, o), ch| {
-            if ch as u32 > 127 {
-                (c + 1, o)
-            } else {
-                (c, o + 1)
-            }
-        });
+    let (chinese, other) = text.chars().fold((0, 0), |(c, o), ch| {
+        if ch as u32 > 127 {
+            (c + 1, o)
+        } else {
+            (c, o + 1)
+        }
+    });
 
     chinese + other / 4 + 1
 }
@@ -683,6 +713,10 @@ pub fn truncate(text: &str, max_chars: usize) -> String {
     if text.len() <= max_chars {
         text.to_string()
     } else {
-        format!("{}\n... [已截断，共 {} 字符]", &text[..max_chars], text.len())
+        format!(
+            "{}\n... [已截断，共 {} 字符]",
+            &text[..max_chars],
+            text.len()
+        )
     }
 }

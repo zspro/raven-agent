@@ -6,16 +6,20 @@
 //! Claude Code 的 FileEditTool 是其编码能力的核心原语。
 
 use super::Tool;
-use raven_types::{FunctionSchema, ToolSchema};
 use async_trait::async_trait;
+use raven_types::{FunctionSchema, ToolSchema};
 use serde_json::json;
 
 pub struct FileEditTool;
 
 #[async_trait]
 impl Tool for FileEditTool {
-    fn name(&self) -> &str { "file_edit" }
-    fn description(&self) -> &str { "精确编辑文件内容（diff 模式）" }
+    fn name(&self) -> &str {
+        "file_edit"
+    }
+    fn description(&self) -> &str {
+        "精确编辑文件内容（diff 模式）"
+    }
 
     fn schema(&self) -> ToolSchema {
         ToolSchema {
@@ -51,7 +55,8 @@ impl Tool for FileEditTool {
         let new_str = args["new_string"].as_str().unwrap_or("");
 
         // 读取文件内容
-        let content = tokio::fs::read_to_string(path).await
+        let content = tokio::fs::read_to_string(path)
+            .await
             .map_err(|e| format!("读取文件失败: {} (文件可能不存在)", e))?;
 
         if old_str.is_empty() {
@@ -60,7 +65,8 @@ impl Tool for FileEditTool {
             let prefix = if had_newline { "" } else { "\n" };
             let updated = format!("{}{}{}", content, prefix, new_str);
 
-            tokio::fs::write(path, &updated).await
+            tokio::fs::write(path, &updated)
+                .await
                 .map_err(|e| format!("写入失败: {}", e))?;
 
             // 返回追加位置的上下文
@@ -102,7 +108,8 @@ impl Tool for FileEditTool {
             &content[match_pos + old_str.len()..]
         );
 
-        tokio::fs::write(path, &updated).await
+        tokio::fs::write(path, &updated)
+            .await
             .map_err(|e| format!("写入失败: {}", e))?;
 
         // 计算修改的行号
@@ -141,7 +148,11 @@ fn get_context(lines: &[&str], line_idx: usize, context: usize) -> String {
         .enumerate()
         .map(|(i, line)| {
             let line_no = start + i + 1;
-            let marker = if line_no == line_idx + 1 { ">>> " } else { "    " };
+            let marker = if line_no == line_idx + 1 {
+                ">>> "
+            } else {
+                "    "
+            };
             format!("{}{:4} | {}", marker, line_no, line)
         })
         .collect::<Vec<_>>()

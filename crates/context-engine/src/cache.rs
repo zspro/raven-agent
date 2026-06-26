@@ -1,5 +1,5 @@
 //! 响应缓存系统
-//! 
+//!
 //! 缓存 LLM 响应以避免重复请求相同的问题，节省 Token。
 //! 使用请求内容的哈希作为键，缓存文本响应（不缓存工具调用）。
 
@@ -25,6 +25,13 @@ pub struct ResponseCache {
     ttl_secs: u64,
 }
 
+impl Default for ResponseCache {
+    /// 合理默认值：100 条、1 小时过期
+    fn default() -> Self {
+        Self::new(100, 3600)
+    }
+}
+
 impl ResponseCache {
     /// 创建缓存
     pub fn new(max_entries: usize, ttl_secs: u64) -> Self {
@@ -33,11 +40,6 @@ impl ResponseCache {
             max_entries,
             ttl_secs,
         }
-    }
-
-    /// 从配置创建（合理默认值）
-    pub fn default() -> Self {
-        Self::new(100, 3600) // 100条，1小时过期
     }
 
     /// 获取缓存键
@@ -52,14 +54,14 @@ impl ResponseCache {
     /// 查询缓存
     pub async fn get(&self, key: &str) -> Option<ChatResponse> {
         let entries = self.entries.read().await;
-        
+
         if let Some(entry) = entries.get(key) {
             // 检查是否过期
             if entry.created_at.elapsed().as_secs() > self.ttl_secs {
                 debug!("缓存条目已过期: {}", key);
                 return None;
             }
-            
+
             debug!("缓存命中: {}", key);
             return Some(ChatResponse {
                 content: entry.response.clone(),
@@ -74,7 +76,7 @@ impl ResponseCache {
                 },
             });
         }
-        
+
         None
     }
 
@@ -86,23 +88,27 @@ impl ResponseCache {
         }
 
         let mut entries = self.entries.write().await;
-        
+
         // 如果超过容量，移除最旧的条目
         if entries.len() >= self.max_entries {
-            let oldest = entries.iter()
+            let oldest = entries
+                .iter()
                 .min_by_key(|(_, v)| v.created_at)
                 .map(|(k, _)| k.clone());
             if let Some(k) = oldest {
                 entries.remove(&k);
             }
         }
-        
-        entries.insert(key, CacheEntry {
-            response: response.content.clone(),
-            usage: response.usage.clone(),
-            created_at: std::time::Instant::now(),
-        });
-        
+
+        entries.insert(
+            key,
+            CacheEntry {
+                response: response.content.clone(),
+                usage: response.usage.clone(),
+                created_at: std::time::Instant::now(),
+            },
+        );
+
         debug!("缓存已存储: {} 条", entries.len());
     }
 

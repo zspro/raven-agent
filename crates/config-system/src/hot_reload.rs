@@ -74,9 +74,7 @@ impl HotReload {
                 continue;
             }
 
-            let modified = std::fs::metadata(path)
-                .and_then(|m| m.modified())
-                .ok();
+            let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok();
 
             let prev = last_modified.get(i).copied().flatten();
 

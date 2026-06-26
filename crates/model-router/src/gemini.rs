@@ -10,10 +10,13 @@
 //! - 工具调用 `functionCall.args` 是完整 JSON 对象（流式也不分块），无需拼接
 //! - tool schema 走 `tools:[{function_declarations:[...]}]`
 
-use raven_types::{ChatResponse, Message, ModelInfo, ProviderConfig, Role, StreamEvent, TokenUsage, ToolCall, ToolCallFunction, ToolSchema};
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
+use raven_types::{
+    ChatResponse, Message, ModelInfo, ProviderConfig, Role, StreamEvent, TokenUsage, ToolCall,
+    ToolCallFunction, ToolSchema,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -92,7 +95,8 @@ impl GeminiClient {
                     });
                     if let Some(last) = contents.last_mut() {
                         if last["role"] == "user" {
-                            let all_fr = last["parts"].as_array()
+                            let all_fr = last["parts"]
+                                .as_array()
                                 .map(|a| a.iter().all(|p| p.get("functionResponse").is_some()))
                                 .unwrap_or(false);
                             if all_fr {
@@ -115,11 +119,16 @@ impl GeminiClient {
     }
 
     fn convert_tools(tools: &[ToolSchema]) -> Value {
-        let decls: Vec<Value> = tools.iter().map(|t| json!({
-            "name": t.function.name,
-            "description": t.function.description,
-            "parameters": t.function.parameters,
-        })).collect();
+        let decls: Vec<Value> = tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "name": t.function.name,
+                    "description": t.function.description,
+                    "parameters": t.function.parameters,
+                })
+            })
+            .collect();
         json!([{ "function_declarations": decls }])
     }
 
@@ -170,18 +179,34 @@ impl super::ProviderClient for GeminiClient {
         &self.config.name
     }
 
-    async fn chat(&self, model: &str, messages: &[Message], tools: Option<&[ToolSchema]>) -> Result<ChatResponse, raven_types::AgentError> {
+    async fn chat(
+        &self,
+        model: &str,
+        messages: &[Message],
+        tools: Option<&[ToolSchema]>,
+    ) -> Result<ChatResponse, raven_types::AgentError> {
         let body = self.build_body(messages, tools);
-        let url = format!("{}/models/{}:generateContent?key={}", self.base(), model, self.key());
+        let url = format!(
+            "{}/models/{}:generateContent?key={}",
+            self.base(),
+            model,
+            self.key()
+        );
         debug!("Gemini 请求 model={}", model);
 
-        let resp = self.http
+        let resp = self
+            .http
             .post(&url)
             .header("content-type", "application/json")
             .json(&body)
             .send()
             .await
-            .map_err(|e| raven_types::AgentError::network(format!("请求失败: {}", e), "检查网络连接和 API Key"))?;
+            .map_err(|e| {
+                raven_types::AgentError::network(
+                    format!("请求失败: {}", e),
+                    "检查网络连接和 API Key",
+                )
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -192,9 +217,9 @@ impl super::ProviderClient for GeminiClient {
             ));
         }
 
-        let api: GenerateResponse = resp.json().await.map_err(|e| raven_types::AgentError::network(
-            format!("解析响应失败: {}", e), "API 返回了非预期格式",
-        ))?;
+        let api: GenerateResponse = resp.json().await.map_err(|e| {
+            raven_types::AgentError::network(format!("解析响应失败: {}", e), "API 返回了非预期格式")
+        })?;
 
         let mut content = String::new();
         let mut tool_calls = Vec::new();
@@ -219,17 +244,30 @@ impl super::ProviderClient for GeminiClient {
         })
     }
 
-    async fn chat_stream(&self, model: &str, messages: &[Message], tools: Option<&[ToolSchema]>) -> Result<mpsc::Receiver<StreamEvent>, raven_types::AgentError> {
+    async fn chat_stream(
+        &self,
+        model: &str,
+        messages: &[Message],
+        tools: Option<&[ToolSchema]>,
+    ) -> Result<mpsc::Receiver<StreamEvent>, raven_types::AgentError> {
         let body = self.build_body(messages, tools);
-        let url = format!("{}/models/{}:streamGenerateContent?alt=sse&key={}", self.base(), model, self.key());
+        let url = format!(
+            "{}/models/{}:streamGenerateContent?alt=sse&key={}",
+            self.base(),
+            model,
+            self.key()
+        );
 
-        let resp = self.http
+        let resp = self
+            .http
             .post(&url)
             .header("content-type", "application/json")
             .json(&body)
             .send()
             .await
-            .map_err(|e| raven_types::AgentError::network(format!("请求失败: {}", e), "检查网络连接"))?;
+            .map_err(|e| {
+                raven_types::AgentError::network(format!("请求失败: {}", e), "检查网络连接")
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -285,12 +323,16 @@ impl super::ProviderClient for GeminiClient {
                                     }
                                 }
                                 if let Some(usage) = chunk.usage_metadata {
-                                    let _ = tx.send(StreamEvent::usage(TokenUsage {
-                                        input: usage.prompt_token_count as usize,
-                                        output: usage.candidates_token_count as usize,
-                                        total: usage.total_token_count as usize,
-                                        cached: usage.cached_content_token_count.map(|t| t as usize),
-                                    })).await;
+                                    let _ = tx
+                                        .send(StreamEvent::usage(TokenUsage {
+                                            input: usage.prompt_token_count as usize,
+                                            output: usage.candidates_token_count as usize,
+                                            total: usage.total_token_count as usize,
+                                            cached: usage
+                                                .cached_content_token_count
+                                                .map(|t| t as usize),
+                                        }))
+                                        .await;
                                 }
                             }
                             Err(e) => trace!("跳过无法解析的 Gemini SSE: {}", e),
@@ -311,14 +353,19 @@ impl super::ProviderClient for GeminiClient {
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, raven_types::AgentError> {
-        Ok(self.config.models.iter().map(|m| ModelInfo {
-            id: format!("{}/{}", self.config.name, m),
-            name: m.clone(),
-            provider: self.config.name.clone(),
-            max_tokens: 1_000_000,
-            supports_tools: true,
-            supports_vision: true,
-        }).collect())
+        Ok(self
+            .config
+            .models
+            .iter()
+            .map(|m| ModelInfo {
+                id: format!("{}/{}", self.config.name, m),
+                name: m.clone(),
+                provider: self.config.name.clone(),
+                max_tokens: 1_000_000,
+                supports_tools: true,
+                supports_vision: true,
+            })
+            .collect())
     }
 }
 

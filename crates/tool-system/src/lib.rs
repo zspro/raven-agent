@@ -1,21 +1,21 @@
 //! # tool-system
 //! 工具注册和执行系统
 
-use raven_types::{ToolCall, ToolResult, ToolSchema};
 use async_trait::async_trait;
+use raven_types::{ToolCall, ToolResult, ToolSchema};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
 pub mod builtin;
-pub mod file_edit;
-pub mod view;
-pub mod mcp;
 pub mod diff_display;
-pub mod web_tools;
+pub mod file_edit;
 pub mod git_first;
+pub mod mcp;
 pub mod repo_map;
+pub mod view;
+pub mod web_tools;
 
 use builtin::*;
 use file_edit::*;
@@ -34,6 +34,12 @@ pub trait Tool: Send + Sync {
 /// 工具注册表
 pub struct Registry {
     tools: Arc<RwLock<HashMap<String, Box<dyn Tool>>>>,
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Registry {
@@ -97,11 +103,10 @@ impl Registry {
         let tools = self.tools.read().await;
 
         if let Some(tool) = tools.get(&call.function.name) {
-            let args = serde_json::from_str::<serde_json::Value>(raw_args)
-                .unwrap_or_else(|e| {
-                    debug!("工具参数解析失败，使用空对象: {e} | raw={:.100}", raw_args);
-                    serde_json::Value::Object(serde_json::Map::new())
-                });
+            let args = serde_json::from_str::<serde_json::Value>(raw_args).unwrap_or_else(|e| {
+                debug!("工具参数解析失败，使用空对象: {e} | raw={:.100}", raw_args);
+                serde_json::Value::Object(serde_json::Map::new())
+            });
 
             let start = std::time::Instant::now();
 
@@ -117,14 +122,12 @@ impl Registry {
                         is_error: false,
                     }
                 }
-                Err(e) => {
-                    ToolResult {
-                        tool_call_id: call.id.clone(),
-                        name: call.function.name.clone(),
-                        content: format!("错误: {}", e),
-                        is_error: true,
-                    }
-                }
+                Err(e) => ToolResult {
+                    tool_call_id: call.id.clone(),
+                    name: call.function.name.clone(),
+                    content: format!("错误: {}", e),
+                    is_error: true,
+                },
             }
         } else {
             ToolResult {
