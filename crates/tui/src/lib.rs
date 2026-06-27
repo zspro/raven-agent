@@ -1346,8 +1346,10 @@ impl Renderer {
             }
             // 行内容
             for (ci, w) in col_widths.iter().enumerate() {
-                let cell = row.get(ci).map(|s| s.as_str()).unwrap_or("");
-                let pad = visible_width(cell);
+                let raw = row.get(ci).map(|s| s.as_str()).unwrap_or("");
+                // 超过列宽的单元格按可见宽度截断（补 …），保证右边框与顶部边框对齐
+                let cell = truncate_to_width(raw, *w);
+                let pad = visible_width(&cell);
                 let extra = if pad < *w { w - pad } else { 0 };
                 let pad_str = spacer(extra);
                 if is_hdr {
@@ -1391,7 +1393,14 @@ impl Renderer {
         };
         let theme = &self.theme_set.themes["base16-ocean.dark"];
         let mut h = HighlightLines::new(syntax, theme);
-        let w = code.lines().next().map_or(0, |l| l.len()).max(40);
+        // 框宽取「所有代码行的最大显示宽度」，且按显示宽度（CJK 记 2）而非
+        // 字节长度计算——否则含中文的代码行会让边框过宽且对不齐。
+        let w = code
+            .lines()
+            .map(|l| l.chars().map(char_display_width).sum::<usize>())
+            .max()
+            .unwrap_or(0)
+            .max(40);
 
         let dim = ColorTheme::DIM;
         let rst = ColorTheme::RESET;
@@ -1487,6 +1496,47 @@ fn char_display_width(c: char) -> usize {
 
 fn spacer(n: usize) -> String {
     " ".repeat(n)
+}
+
+/// 将字符串按可见宽度截断到 `max`（含尾部 `…`），跳过 ANSI 转义码、尊重 CJK 宽度。
+/// 不含转义码且本身不超宽时原样返回；超宽时在末尾补一个宽度 1 的 `…`。
+fn truncate_to_width(s: &str, max: usize) -> String {
+    if visible_width(s) <= max {
+        return s.to_string();
+    }
+    // 需要截断：为 `…` 预留 1 列
+    let budget = max.saturating_sub(1);
+    let mut out = String::new();
+    let mut w = 0usize;
+    let mut in_esc = false;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if in_esc {
+            out.push(bytes[i] as char);
+            if bytes[i] == b'm' {
+                in_esc = false;
+            }
+            i += 1;
+            continue;
+        }
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            out.push_str("\x1b[");
+            in_esc = true;
+            i += 2;
+            continue;
+        }
+        let ch = s[i..].chars().next().unwrap_or(' ');
+        let cw = char_display_width(ch);
+        if w + cw > budget {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+        i += ch.len_utf8();
+    }
+    out.push('…');
+    out
 }
 
 fn table_border_top(widths: &[usize]) -> String {
@@ -1728,33 +1778,48 @@ fn normalize_nested_fences(text: &str) -> String {
         return text.to_string();
     }
 
-    let new_len = max_len + max_depth;
+    // 按嵌套深度分配围栏长度：外层比内层长，保证内层关闭围栏不会
+    // 误关外层。depth=1（最外层）最长，越往里越短，最里层保持原始长度
+    // （至少 3）。把「开/关」配对：用栈记录每个开围栏所在的深度，关围栏
+    // 沿用同一深度，从而成对加长。
+    let target_len = |depth: usize| -> usize {
+        // 最外层 depth=1 → max_len + max_depth - 1；最内层 depth=max_depth → max_len
+        max_len + (max_depth - depth)
+    };
+
     let mut result = String::with_capacity(text.len() + fences.len() * 3);
     let mut prev_line = 0usize;
+    let mut depth_stack: Vec<usize> = Vec::new();
+    let mut cur_depth = 0usize;
 
-    // 重建文本，替换外层的围栏长度
     for (li, fm, is_open) in &fences {
-        if fm.length < new_len {
-            // 推入此行之前的内容
-            for l in &lines[prev_line..*li] {
-                result.push_str(l);
-                result.push('\n');
-            }
-            // 替换围栏行
+        let this_depth = if *is_open {
+            cur_depth += 1;
+            depth_stack.push(cur_depth);
+            cur_depth
+        } else {
+            let d = depth_stack.pop().unwrap_or(cur_depth);
+            cur_depth = cur_depth.saturating_sub(1);
+            d
+        };
+        let want = target_len(this_depth);
+
+        // 推入此围栏行之前的普通内容
+        for l in &lines[prev_line..*li] {
+            result.push_str(l);
+            result.push('\n');
+        }
+
+        if fm.length != want {
             let old_fence: String = std::iter::repeat_n(fm.character, fm.length).collect();
-            let new_fence: String = std::iter::repeat_n(fm.character, new_len).collect();
+            let new_fence: String = std::iter::repeat_n(fm.character, want).collect();
             let line = lines[*li].replacen(&old_fence, &new_fence, 1);
             result.push_str(&line);
-            result.push('\n');
-            prev_line = *li + 1;
-        } else if *is_open {
-            // 推入之前的行（包括当前围栏行）
-            for l in &lines[prev_line..=*li] {
-                result.push_str(l);
-                result.push('\n');
-            }
-            prev_line = *li + 1;
+        } else {
+            result.push_str(lines[*li]);
         }
+        result.push('\n');
+        prev_line = *li + 1;
     }
     // 推入剩余的行
     for l in &lines[prev_line..] {
