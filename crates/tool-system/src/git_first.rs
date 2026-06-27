@@ -5,6 +5,40 @@
 
 use tracing::{debug, info};
 
+/// 按字符（而非字节）截断字符串，超长时追加 `...`。
+/// 直接对含中文的字符串做 `&s[..n]` 会切在 UTF-8 字符中间导致 panic，故按 char 处理。
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        let t: String = s.chars().take(max).collect();
+        format!("{}...", t)
+    } else {
+        s.to_string()
+    }
+}
+
+/// 取短 hash 前缀（hash 为 ASCII，但长度可能不足 7，故用 min 防越界）。
+fn short_hash(hash: &str) -> &str {
+    &hash[..7.min(hash.len())]
+}
+
+/// 把文件路径拆成 (git -C 的目录, 相对该目录的 pathspec)。
+///
+/// git 的 `-C <dir>` 会先切到 `dir`，其后的 pathspec 相对 `dir` 解析。
+/// 因此若用 `path.parent()` 作 `-C` 目录，pathspec 必须是相对该目录的部分
+/// （即文件名），否则会出现 `git -C src add src/main.rs` → 找 src/src/main.rs 的错误。
+fn split_repo_and_file(path: &str) -> (String, String) {
+    let p = std::path::Path::new(path);
+    let dir = match p.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_string_lossy().into_owned(),
+        _ => ".".to_string(),
+    };
+    let file = p
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string());
+    (dir, file)
+}
+
 /// Git-first 管理器
 pub struct GitFirst {
     enabled: bool,
@@ -53,13 +87,11 @@ impl GitFirst {
             return Ok(None);
         }
 
-        let repo_path = std::path::Path::new(path)
-            .parent()
-            .unwrap_or(std::path::Path::new("."));
+        let (repo_str, _) = split_repo_and_file(path);
 
         // 获取当前 HEAD hash（用于回滚）
         let output = std::process::Command::new("git")
-            .args(["-C", repo_path.to_str().unwrap_or("."), "rev-parse", "HEAD"])
+            .args(["-C", &repo_str, "rev-parse", "HEAD"])
             .output()
             .map_err(|e| format!("git 失败: {}", e))?;
 
@@ -68,7 +100,7 @@ impl GitFirst {
         }
 
         let head = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        debug!("pre-edit HEAD: {} ({})", &head[..7.min(head.len())], path);
+        debug!("pre-edit HEAD: {} ({})", short_hash(&head), path);
 
         Ok(Some(head))
     }
@@ -84,15 +116,11 @@ impl GitFirst {
             return Ok("Git-first 已禁用".to_string());
         }
 
-        let repo_path = std::path::Path::new(path)
-            .parent()
-            .unwrap_or(std::path::Path::new("."));
-
-        let repo_str = repo_path.to_str().unwrap_or(".");
+        let (repo_str, file_spec) = split_repo_and_file(path);
 
         // 1. git add
         let add_output = std::process::Command::new("git")
-            .args(["-C", repo_str, "add", path])
+            .args(["-C", &repo_str, "add", &file_spec])
             .output()
             .map_err(|e| format!("git add 失败: {}", e))?;
 
@@ -103,7 +131,7 @@ impl GitFirst {
 
         // 2. 检查是否有变更要提交
         let diff_check = std::process::Command::new("git")
-            .args(["-C", repo_str, "diff", "--cached", "--quiet"])
+            .args(["-C", &repo_str, "diff", "--cached", "--quiet"])
             .output()
             .map_err(|e| format!("git diff 失败: {}", e))?;
 
@@ -117,15 +145,11 @@ impl GitFirst {
             "[{}] {}: {}",
             self.commit_prefix,
             tool_name,
-            if description.len() > 50 {
-                format!("{}...", &description[..50])
-            } else {
-                description.to_string()
-            }
+            truncate_chars(description, 50)
         );
 
         let commit_output = std::process::Command::new("git")
-            .args(["-C", repo_str, "commit", "-m", &commit_msg])
+            .args(["-C", &repo_str, "commit", "-m", &commit_msg])
             .output()
             .map_err(|e| format!("git commit 失败: {}", e))?;
 
@@ -140,7 +164,7 @@ impl GitFirst {
 
         // 获取新的 commit hash
         let hash_output = std::process::Command::new("git")
-            .args(["-C", repo_str, "rev-parse", "--short", "HEAD"])
+            .args(["-C", &repo_str, "rev-parse", "--short", "HEAD"])
             .output()
             .map_err(|e| format!("获取 commit hash 失败: {}", e))?;
 
@@ -148,30 +172,22 @@ impl GitFirst {
             .trim()
             .to_string();
 
-        info!("Git-first: 已提交 {} ({}", hash, path);
+        info!("Git-first: 已提交 {} ({})", hash, path);
 
         Ok(format!(
-            "已自动提交: {} ({}",
+            "已自动提交: {} ({})",
             hash,
-            if commit_msg.len() > 60 {
-                format!("{}...", &commit_msg[..60])
-            } else {
-                commit_msg
-            }
+            truncate_chars(&commit_msg, 60)
         ))
     }
 
     /// 回滚到编辑前的状态
     pub fn rollback(&self, path: &str, before_hash: &str) -> Result<String, String> {
-        let repo_path = std::path::Path::new(path)
-            .parent()
-            .unwrap_or(std::path::Path::new("."));
-
-        let repo_str = repo_path.to_str().unwrap_or(".");
+        let (repo_str, file_spec) = split_repo_and_file(path);
 
         // git checkout 文件到之前的版本
         let output = std::process::Command::new("git")
-            .args(["-C", repo_str, "checkout", before_hash, "--", path])
+            .args(["-C", &repo_str, "checkout", before_hash, "--", &file_spec])
             .output()
             .map_err(|e| format!("回滚失败: {}", e))?;
 
@@ -180,20 +196,18 @@ impl GitFirst {
             return Err(format!("回滚失败: {}", stderr));
         }
 
-        info!("Git-first: 已回滚 {} 到 {}", path, &before_hash[..7]);
-        Ok(format!("已回滚到 {}", &before_hash[..7]))
+        info!("Git-first: 已回滚 {} 到 {}", path, short_hash(before_hash));
+        Ok(format!("已回滚到 {}", short_hash(before_hash)))
     }
 
     /// 获取最近的提交历史
     pub fn recent_commits(&self, path: &str, count: usize) -> Result<String, String> {
-        let repo_path = std::path::Path::new(path)
-            .parent()
-            .unwrap_or(std::path::Path::new("."));
+        let (repo_str, _) = split_repo_and_file(path);
 
         let output = std::process::Command::new("git")
             .args([
                 "-C",
-                repo_path.to_str().unwrap_or("."),
+                &repo_str,
                 "log",
                 "--oneline",
                 "-n",

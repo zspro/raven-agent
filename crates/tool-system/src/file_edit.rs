@@ -26,17 +26,17 @@ impl Tool for FileEditTool {
             schema_type: "function".to_string(),
             function: FunctionSchema {
                 name: "file_edit".to_string(),
-                description: "精确编辑文件。提供 old_string（文件中现有的内容）和 new_string（替换后的内容）。\n\n规则:\n1. old_string 必须在文件中精确匹配（包括缩进）\n2. 如果 old_string 为空，new_string 将追加到文件末尾\n3. 修改后会返回修改位置的上下文（修改前后3行）\n4. 如需多次修改同一文件，需多次调用".to_string(),
+                description: "对已存在的文件做精确替换编辑。这是修改代码的首选工具，应优先于 file_write（后者会整体覆写、容易误伤）。\n\n使用前提：编辑前必须先用 view 读过该文件，确保 old_string 与文件现有内容逐字符匹配。\n\n规则:\n1. old_string 必须在文件中精确匹配，包括缩进、空格和换行；若文件中出现多处相同内容，需扩大 old_string 范围使其唯一。\n2. old_string 为空字符串时，new_string 追加到文件末尾。\n3. 修改后返回改动位置前后 3 行的上下文，便于核对。\n4. 一次调用只替换一处；需要改同一文件的多处时，多次调用（每次改动后文件内容已变，注意重新比对）。".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "文件路径（相对或绝对）"
+                            "description": "要编辑的文件路径（相对或绝对）。"
                         },
                         "old_string": {
                             "type": "string",
-                            "description": "文件中要替换的现有内容。必须精确匹配（包括缩进和空格）。如果为空字符串则追加到文件末尾。"
+                            "description": "文件中要被替换的现有内容，必须逐字符精确匹配（含缩进与空格），且在文件中唯一。从 view 输出复制时不要带上行号前缀。为空字符串则表示追加到文件末尾。"
                         },
                         "new_string": {
                             "type": "string",

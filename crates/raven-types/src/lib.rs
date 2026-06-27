@@ -529,27 +529,23 @@ fn default_shell_timeout() -> u64 {
     30
 }
 
+/// 默认允许的 shell 命令集（按平台区分）。
+///
+/// Windows 与类 Unix 的常用命令不同（如 Windows 用 `dir`/`type`，
+/// Unix 用 `ls`/`cat`），这里按编译目标平台给出对应默认集，
+/// 避免在 Windows 上把一堆 Unix 命令塞进白名单导致全部不可用。
 fn default_allowed_shell_commands() -> Vec<String> {
-    vec![
-        "ls".to_string(),
-        "cat".to_string(),
-        "grep".to_string(),
-        "find".to_string(),
-        "git".to_string(),
-        "go".to_string(),
-        "npm".to_string(),
-        "node".to_string(),
-        "echo".to_string(),
-        "pwd".to_string(),
-        "head".to_string(),
-        "tail".to_string(),
-        "wc".to_string(),
-        "mkdir".to_string(),
-        "touch".to_string(),
-        "cp".to_string(),
-        "mv".to_string(),
-        "curl".to_string(),
-    ]
+    #[cfg(windows)]
+    let cmds: &[&str] = &[
+        "dir", "type", "findstr", "where", "git", "go", "npm", "node", "echo", "cd", "more",
+        "tree", "curl", "python", "cargo",
+    ];
+    #[cfg(not(windows))]
+    let cmds: &[&str] = &[
+        "ls", "cat", "grep", "find", "git", "go", "npm", "node", "echo", "pwd", "head", "tail",
+        "wc", "mkdir", "touch", "cp", "mv", "curl",
+    ];
+    cmds.iter().map(|s| s.to_string()).collect()
 }
 
 /// HTTP 服务器配置
@@ -726,15 +722,15 @@ pub fn estimate_tokens(text: &str) -> usize {
     chinese + other / 4 + 1
 }
 
-/// 截断过长字符串
+/// 截断过长字符串。
+///
+/// 注意：`max_chars` 语义为「最多保留的字符数」，按 Unicode 字符（而非字节）
+/// 截断，避免在多字节 UTF-8 字符（如中文）中间切断导致 panic。
 pub fn truncate(text: &str, max_chars: usize) -> String {
-    if text.len() <= max_chars {
+    if text.chars().count() <= max_chars {
         text.to_string()
     } else {
-        format!(
-            "{}\n... [已截断，共 {} 字符]",
-            &text[..max_chars],
-            text.len()
-        )
+        let head: String = text.chars().take(max_chars).collect();
+        format!("{}\n... [已截断，共 {} 字符]", head, text.chars().count())
     }
 }

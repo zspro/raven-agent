@@ -37,17 +37,17 @@ impl Tool for WebSearchTool {
             schema_type: "function".to_string(),
             function: FunctionSchema {
                 name: "web_search".to_string(),
-                description: "在搜索引擎中搜索指定关键词。返回搜索结果的标题、链接和摘要。\n\n注意：需要有网络连接，且搜索服务可能有限制。".to_string(),
+                description: "用搜索引擎检索关键词，返回若干条结果的标题、链接和摘要。\n\n何时使用：需要最新信息、超出已有知识、或要核实事实时。摘要往往很短，确定某条结果有价值后，用 fetch_url 拉取该链接的正文细读。\n注意：依赖网络连接，搜索服务可能限流。".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "搜索关键词"
+                            "description": "搜索关键词，尽量简洁（几个词即可）。"
                         },
                         "num_results": {
                             "type": "integer",
-                            "description": "返回结果数量（默认5，最大10）"
+                            "description": "返回结果数量（可选，默认 5，最大 10）。"
                         }
                     },
                     "required": ["query"]
@@ -133,17 +133,17 @@ impl Tool for FetchUrlTool {
             schema_type: "function".to_string(),
             function: FunctionSchema {
                 name: "fetch_url".to_string(),
-                description: "获取指定 URL 的网页内容。自动提取正文文本，去除 HTML 标签。支持 HTML 和 Markdown 页面。".to_string(),
+                description: "抓取指定 URL 的网页并提取正文文本，自动去除 HTML 标签，支持 HTML 与 Markdown 页面。\n\n何时使用：已有具体 URL（用户给出的，或 web_search 返回的链接），需要阅读其完整内容时。URL 必须带协议（https://）。超长页面用 max_length 截断。".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "url": {
                             "type": "string",
-                            "description": "要获取的 URL"
+                            "description": "要抓取的完整 URL，必须包含协议（如 https://example.com）。"
                         },
                         "max_length": {
                             "type": "integer",
-                            "description": "最大字符数（默认5000）"
+                            "description": "提取正文的最大字符数（可选，默认 5000）。"
                         }
                     },
                     "required": ["url"]
@@ -185,12 +185,12 @@ impl Tool for FetchUrlTool {
 
         // 提取文本内容
         let text = extract_text_from_html(&body);
-        let truncated = if text.len() > max_len {
-            format!(
-                "{}...\n\n[已截断，共 {} 字符]",
-                &text[..max_len],
-                text.len()
-            )
+        // 按 Unicode 字符（而非字节）截断，避免在多字节字符（如中文）中间
+        // 切断导致 panic。max_len 语义为「最多保留的字符数」。
+        let char_count = text.chars().count();
+        let truncated = if char_count > max_len {
+            let head: String = text.chars().take(max_len).collect();
+            format!("{}...\n\n[已截断，共 {} 字符]", head, char_count)
         } else {
             text
         };

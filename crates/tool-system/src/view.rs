@@ -26,21 +26,21 @@ impl Tool for ViewTool {
             schema_type: "function".to_string(),
             function: FunctionSchema {
                 name: "view".to_string(),
-                description: "查看文件或目录。\n\n- 文件：返回带行号的内容，支持行范围（offset/limit）\n- 目录：返回树形结构，标记文件/目录/大小\n\n这是查看代码的主要工具，比 file_read 提供更多信息。".to_string(),
+                description: "查看文件内容或目录结构。这是读取代码和探查目录的首选工具，应优先于 file_read 和 list_dir 使用。\n\n何时使用：\n- 编辑文件前先 view 一遍，确认 file_edit 的 old_string 能精确匹配（行号前缀仅用于展示，不要包含进 old_string）。\n- 浏览陌生目录结构、定位文件。\n\n行为：\n- 路径是文件时，返回带行号的内容；大文件可用 offset/limit 翻页，避免一次拉取过多。\n- 路径是目录时，返回树形结构，并标记文件/目录及大小。".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "文件或目录路径"
+                            "description": "要查看的文件或目录路径（相对或绝对）。"
                         },
                         "offset": {
                             "type": "integer",
-                            "description": "起始行号（从1开始，仅文件，可选）"
+                            "description": "起始行号（从 1 开始，仅对文件生效，可选）。仅在文件较大、需要从中间读起时提供。"
                         },
                         "limit": {
                             "type": "integer",
-                            "description": "最大行数（默认50，仅文件，可选）"
+                            "description": "最多读取的行数（默认 50，仅对文件生效，可选）。"
                         }
                     },
                     "required": ["path"]
@@ -87,7 +87,7 @@ async fn view_file(
 
     // 转换为 0-indexed
     let start = offset.saturating_sub(1).min(total_lines);
-    let end = (start + limit).min(total_lines);
+    let end = start.saturating_add(limit).min(total_lines);
 
     // 构建输出行
     let mut output_lines = Vec::new();

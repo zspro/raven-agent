@@ -314,4 +314,29 @@ models = ["deepseek-chat", "deepseek-coder"]
         assert_eq!(resp.usage.total, 15);
         assert_eq!(resp.finish_reason, "stop");
     }
+
+    #[test]
+    fn test_truncate_multibyte_no_panic() {
+        // 多字节中文字符串，max_chars 落在「字符」边界而非「字节」边界。
+        // 旧实现用 &s[..n] 会在多字节字符中间切断导致 panic。
+        let s = "中文测试字符串很长一段内容";
+        let out = truncate(s, 5);
+        // 保留前 5 个字符 + 截断提示，且不 panic。
+        assert!(out.starts_with("中文测试字"));
+        assert!(out.contains("已截断"));
+    }
+
+    #[test]
+    fn test_truncate_no_truncation_when_short() {
+        let s = "短文本";
+        assert_eq!(truncate(s, 10), "短文本");
+    }
+
+    #[test]
+    fn test_truncate_ascii_boundary() {
+        let s = "hello world";
+        let out = truncate(s, 5);
+        assert!(out.starts_with("hello"));
+        assert!(out.contains("已截断"));
+    }
 }
