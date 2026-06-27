@@ -6,7 +6,6 @@
 //! Aider 使用 Tree-sitter 做语法分析，我们这里用轻量级方法：
 //! 基于文件扩展名和简单的正则匹配提取关键符号。
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// 文件类型
@@ -130,13 +129,6 @@ impl RepoMap {
             format_size(total_size)
         ));
         lines.push("═".repeat(60));
-
-        // 按文件类型分组
-        let mut by_kind: HashMap<String, Vec<&RepoMapEntry>> = HashMap::new();
-        for e in entries {
-            let key = format!("{:?}", std::mem::discriminant(&e.kind));
-            by_kind.entry(key).or_default().push(e);
-        }
 
         // 显示每个文件
         for entry in entries {
@@ -286,7 +278,6 @@ impl RepoMap {
     }
 
     fn extract_rust_symbols(content: &str) -> Vec<Symbol> {
-        let mut symbols = Vec::new();
         let patterns = [
             (r"^\s*(?:pub\s+)?fn\s+(\w+)", SymbolKind::Function),
             (r"^\s*(?:pub\s+)?struct\s+(\w+)", SymbolKind::Struct),
@@ -296,54 +287,18 @@ impl RepoMap {
             (r"^\s*(?:pub\s+)?const\s+(\w+)", SymbolKind::Const),
             (r"^\s*(?:pub\s+)?type\s+(\w+)", SymbolKind::Type),
         ];
-
-        for (i, line) in content.lines().enumerate() {
-            for (pattern, kind) in &patterns {
-                if let Ok(re) = regex::Regex::new(pattern) {
-                    if let Some(cap) = re.captures(line) {
-                        if let Some(name) = cap.get(1) {
-                            symbols.push(Symbol {
-                                name: name.as_str().to_string(),
-                                kind: kind.clone(),
-                                line: i + 1,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        symbols
+        Self::extract_by_patterns(content, &patterns)
     }
 
     fn extract_python_symbols(content: &str) -> Vec<Symbol> {
-        let mut symbols = Vec::new();
         let patterns = [
             (r"^\s*def\s+(\w+)", SymbolKind::Function),
             (r"^\s*class\s+(\w+)", SymbolKind::Class),
         ];
-
-        for (i, line) in content.lines().enumerate() {
-            for (pattern, kind) in &patterns {
-                if let Ok(re) = regex::Regex::new(pattern) {
-                    if let Some(cap) = re.captures(line) {
-                        if let Some(name) = cap.get(1) {
-                            symbols.push(Symbol {
-                                name: name.as_str().to_string(),
-                                kind: kind.clone(),
-                                line: i + 1,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        symbols
+        Self::extract_by_patterns(content, &patterns)
     }
 
     fn extract_go_symbols(content: &str) -> Vec<Symbol> {
-        let mut symbols = Vec::new();
         let patterns = [
             (r"^\s*func\s+(?:\(.*\)\s+)?(\w+)", SymbolKind::Function),
             (
@@ -351,28 +306,10 @@ impl RepoMap {
                 SymbolKind::Struct,
             ),
         ];
-
-        for (i, line) in content.lines().enumerate() {
-            for (pattern, kind) in &patterns {
-                if let Ok(re) = regex::Regex::new(pattern) {
-                    if let Some(cap) = re.captures(line) {
-                        if let Some(name) = cap.get(1) {
-                            symbols.push(Symbol {
-                                name: name.as_str().to_string(),
-                                kind: kind.clone(),
-                                line: i + 1,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        symbols
+        Self::extract_by_patterns(content, &patterns)
     }
 
     fn extract_js_symbols(content: &str) -> Vec<Symbol> {
-        let mut symbols = Vec::new();
         let patterns = [
             (
                 r"^\s*(?:export\s+)?(?:async\s+)?function\s+(\w+)",
@@ -381,23 +318,33 @@ impl RepoMap {
             (r"^\s*(?:export\s+)?class\s+(\w+)", SymbolKind::Class),
             (r"^\s*const\s+(\w+)\s*=[^=]", SymbolKind::Const),
         ];
+        Self::extract_by_patterns(content, &patterns)
+    }
 
+    /// 用一组（正则, 符号类型）扫描内容提取符号。
+    ///
+    /// 正则在按行扫描前一次性编译，避免在「每行 × 每模式」内重复编译
+    /// （这是之前的性能 bug：大文件会触发成千上万次正则编译）。
+    fn extract_by_patterns(content: &str, patterns: &[(&str, SymbolKind)]) -> Vec<Symbol> {
+        let compiled: Vec<(regex::Regex, &SymbolKind)> = patterns
+            .iter()
+            .filter_map(|(pat, kind)| regex::Regex::new(pat).ok().map(|re| (re, kind)))
+            .collect();
+
+        let mut symbols = Vec::new();
         for (i, line) in content.lines().enumerate() {
-            for (pattern, kind) in &patterns {
-                if let Ok(re) = regex::Regex::new(pattern) {
-                    if let Some(cap) = re.captures(line) {
-                        if let Some(name) = cap.get(1) {
-                            symbols.push(Symbol {
-                                name: name.as_str().to_string(),
-                                kind: kind.clone(),
-                                line: i + 1,
-                            });
-                        }
+            for (re, kind) in &compiled {
+                if let Some(cap) = re.captures(line) {
+                    if let Some(name) = cap.get(1) {
+                        symbols.push(Symbol {
+                            name: name.as_str().to_string(),
+                            kind: (*kind).clone(),
+                            line: i + 1,
+                        });
                     }
                 }
             }
         }
-
         symbols
     }
 }
