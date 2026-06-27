@@ -131,9 +131,16 @@ impl Tool for FileEditTool {
             "(行数不变)".to_string()
         };
 
+        // 彩色 diff 展示被替换的片段（old_string vs new_string）。
+        // 用局部片段而非整文件做 diff：更聚焦，也天然规避大文件 LCS 开销。
+        // 片段过大时 render_edit_diff 返回 None，此处回退到仅上下文显示。
+        let diff_block = super::diff_display::render_edit_diff(old_str, new_str, 400)
+            .map(|d| format!("\n\n变更:\n{}", d))
+            .unwrap_or_default();
+
         Ok(format!(
-            "已修改 {} (第{}行) {}\n\n修改后上下文:\n{}",
-            path, edit_line, diff_str, context
+            "已修改 {} (第{}行) {}{}\n\n修改后上下文:\n{}",
+            path, edit_line, diff_str, diff_block, context
         ))
     }
 }

@@ -79,7 +79,7 @@ pub fn compute_diff(old_text: &str, new_text: &str) -> Vec<DiffLine> {
     filter_context(&result, context_size)
 }
 
-/// 格式化 diff 为终端可显示的字符串（带颜色标记）
+/// 格式化 diff 为终端可显示的字符串（纯符号，无颜色）
 pub fn format_diff_terminal(diff: &[DiffLine]) -> String {
     let mut lines = Vec::new();
 
@@ -101,6 +101,42 @@ pub fn format_diff_terminal(diff: &[DiffLine]) -> String {
     }
 
     lines.join("\n")
+}
+
+/// 格式化 diff 为带 ANSI 颜色的终端字符串：删除行红色、新增行绿色、
+/// hunk 头青色、上下文暗色。供 file_edit 等编辑工具展示改动用。
+pub fn format_diff_colored(diff: &[DiffLine]) -> String {
+    const RED: &str = "\x1b[31m";
+    const GREEN: &str = "\x1b[32m";
+    const CYAN: &str = "\x1b[36m";
+    const DIM: &str = "\x1b[2m";
+    const RST: &str = "\x1b[0m";
+
+    let mut lines = Vec::new();
+    for d in diff {
+        match d {
+            DiffLine::Context(text) => lines.push(format!("{DIM}    {text}{RST}")),
+            DiffLine::Old(text) => lines.push(format!("{RED}  - {text}{RST}")),
+            DiffLine::New(text) => lines.push(format!("{GREEN}  + {text}{RST}")),
+            DiffLine::Hunk(header) => lines.push(format!("{CYAN}  {header}{RST}")),
+        }
+    }
+    lines.join("\n")
+}
+
+/// 生成编辑改动的彩色 diff 展示。对过大的文本（行数超过 `max_lines`）返回
+/// None，让调用方回退到轻量显示，避免 LCS 的 O(m*n) 内存开销在大文件上爆炸。
+pub fn render_edit_diff(old_text: &str, new_text: &str, max_lines: usize) -> Option<String> {
+    let old_n = old_text.lines().count();
+    let new_n = new_text.lines().count();
+    if old_n.max(new_n) > max_lines {
+        return None;
+    }
+    let diff = compute_diff(old_text, new_text);
+    if diff.is_empty() {
+        return None;
+    }
+    Some(format_diff_colored(&diff))
 }
 
 // =============================================================================
@@ -244,4 +280,37 @@ pub fn git_style_diff(old_path: &str, new_path: &str, old_text: &str, new_text: 
     }
 
     result.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_edit_diff_shows_old_and_new() {
+        let out = render_edit_diff("foo\nbar\n", "foo\nbaz\n", 400).unwrap();
+        // bar 被删、baz 新增；ANSI 颜色码存在
+        assert!(out.contains("bar"));
+        assert!(out.contains("baz"));
+        assert!(out.contains("\x1b["));
+    }
+
+    #[test]
+    fn render_edit_diff_returns_none_for_oversized() {
+        let big = "x\n".repeat(500);
+        assert!(render_edit_diff(&big, &big, 400).is_none());
+    }
+
+    #[test]
+    fn render_edit_diff_none_when_identical() {
+        // 完全相同 → compute_diff 只产生上下文，filter 后为空 → None
+        assert!(render_edit_diff("same\n", "same\n", 400).is_none());
+    }
+
+    #[test]
+    fn compute_diff_detects_change() {
+        let diff = compute_diff("a\nb\nc\n", "a\nB\nc\n");
+        assert!(diff.iter().any(|d| matches!(d, DiffLine::Old(t) if t == "b")));
+        assert!(diff.iter().any(|d| matches!(d, DiffLine::New(t) if t == "B")));
+    }
 }
