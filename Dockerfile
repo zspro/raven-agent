@@ -4,21 +4,16 @@
 # =============================================================================
 # 构建阶段
 # =============================================================================
-FROM rust:1.76-slim-bookworm AS builder
+# 注意：根 Cargo.toml 使用 resolver = "3"（需 Rust >= 1.84），
+# 且 Cargo.lock 为 v4 格式（需 Rust >= 1.78）。基础镜像必须足够新，
+# 否则 cargo 会因无法解析 resolver/lock 版本而构建失败。
+FROM rust:1.85-slim-bookworm AS builder
 
 WORKDIR /build
 
-# 安装编译依赖
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config \
-    libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-# 复制依赖定义（利用 Docker 缓存层）
-COPY Cargo.toml Cargo.lock ./
-COPY crates/*/Cargo.toml ./
-
-# 复制源码
+# 复制全部源码后直接构建。
+# 项目使用 rustls（见 Cargo.toml 的 reqwest 特性），不依赖系统 OpenSSL，
+# 因此无需 pkg-config / libssl-dev。
 COPY . .
 
 # 编译 Release 版本
