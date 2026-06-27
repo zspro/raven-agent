@@ -148,11 +148,14 @@ impl ContextManager {
 
     /// 从 checkpoint 恢复消息历史（覆盖当前历史）。
     /// 传入的消息若以 system 消息开头，会被剥离（系统提示词单独管理）。
+    /// 例外：压缩产生的「[历史对话摘要]」系统消息是会话内容的一部分，需保留，
+    /// 否则恢复会话时会丢失被压缩掉的早期对话。
     pub async fn restore_messages(&self, restored: Vec<Message>) {
         let mut msgs = self.messages.write().await;
         msgs.clear();
         for m in restored {
-            if m.role == raven_types::Role::System {
+            if m.role == raven_types::Role::System && !m.content.starts_with("[历史对话摘要]")
+            {
                 continue;
             }
             msgs.push(m);
@@ -178,7 +181,17 @@ impl ContextManager {
         }
 
         // 提取需要压缩的部分
-        let split_at = msg_len - keep_count;
+        let mut split_at = msg_len - keep_count;
+        // 避免把「带 tool_calls 的 assistant」与其后的 tool 结果切开：
+        // 若保留段开头是孤立的 Tool 消息（对应的 assistant 已被压缩），
+        // 向后推进切点，把这些孤儿一并纳入压缩段，否则 API 会拒绝
+        // 「没有前置 tool_calls 的 tool 消息」。
+        while split_at < msg_len && msgs[split_at].role == raven_types::Role::Tool {
+            split_at += 1;
+        }
+        if split_at >= msg_len {
+            return Ok(()); // 全是待压缩内容，本轮不动（极少见）
+        }
         let to_compress: Vec<Message> = msgs.drain(..split_at).collect();
 
         // 生成摘要
@@ -475,4 +488,89 @@ pub struct ContextStats {
     pub total_tokens: usize,
     pub message_count: usize,
     pub budget_status: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use raven_types::{Config, Message, ToolCall, ToolCallFunction};
+
+    fn mgr_with_keep(keep_rounds: usize) -> ContextManager {
+        let mut cfg = Config::default();
+        cfg.context.keep_rounds = keep_rounds;
+        // 关闭持久化，避免测试写入 ~/.raven
+        ContextManager::with_persistence(
+            &cfg,
+            PersistenceOptions {
+                enabled: false,
+                session_id: None,
+                model: "test".to_string(),
+            },
+        )
+    }
+
+    fn assistant_with_tool(call_id: &str) -> Message {
+        let mut m = Message::assistant("");
+        m.tool_calls = Some(vec![ToolCall {
+            index: 0,
+            id: call_id.to_string(),
+            call_type: "function".to_string(),
+            function: ToolCallFunction {
+                name: "shell".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]);
+        m
+    }
+
+    /// B7：压缩切点落在「assistant(tool_calls) + tool 结果」之间时，
+    /// 保留段不应以孤立 Tool 消息开头。
+    #[tokio::test]
+    async fn test_compact_does_not_orphan_tool_results() {
+        let mgr = mgr_with_keep(1); // keep_count = 2
+                                    // 构造：user, assistant(tool), tool, assistant(最终回答)
+        mgr.add_user_message("问题").await;
+        {
+            let mut msgs = mgr.messages.write().await;
+            msgs.push(assistant_with_tool("c1"));
+            msgs.push(Message::tool_result("c1", "shell", "输出"));
+            msgs.push(Message::assistant("最终回答"));
+        }
+        // 原始 split_at = 4 - 2 = 2，恰好落在 tool 结果之前。
+        mgr.compact().await.unwrap();
+
+        let msgs = mgr.messages.read().await;
+        // 第一条是摘要 system，其后不得是孤立 Tool 消息
+        assert_eq!(msgs[0].role, Role::System);
+        assert!(
+            msgs.get(1).map(|m| m.role) != Some(Role::Tool),
+            "保留段不应以孤立 Tool 消息开头"
+        );
+        // 不存在「Tool 紧跟在非 assistant(tool_calls) 之后」的破损配对
+        for w in msgs.windows(2) {
+            if w[1].role == Role::Tool {
+                assert!(
+                    w[0].role == Role::Assistant && w[0].tool_calls.is_some()
+                        || w[0].role == Role::Tool,
+                    "Tool 消息前必须是带 tool_calls 的 assistant 或另一条 Tool"
+                );
+            }
+        }
+    }
+
+    /// B20：恢复会话时应保留「[历史对话摘要]」系统消息。
+    #[tokio::test]
+    async fn test_restore_keeps_compaction_summary() {
+        let mgr = mgr_with_keep(2);
+        let restored = vec![
+            Message::system("你是助手"),                  // 普通系统提示 → 应剥离
+            Message::system("[历史对话摘要] 之前聊了 X"), // 压缩摘要 → 应保留
+            Message::user("继续"),
+        ];
+        mgr.restore_messages(restored).await;
+        let msgs = mgr.messages.read().await;
+        assert_eq!(msgs.len(), 2, "普通系统提示被剥离，摘要与用户消息保留");
+        assert!(msgs[0].content.starts_with("[历史对话摘要]"));
+        assert_eq!(msgs[1].role, Role::User);
+    }
 }
