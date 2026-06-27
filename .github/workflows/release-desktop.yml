@@ -1,0 +1,88 @@
+name: Release Desktop
+
+# 桌面端（Tauri）打包工作流，独立于 CLI 的 release.yml。
+# 故意不绑定 CLI 发布：桌面构建较重且可能失败，分开避免拖累 CLI Release。
+#
+# 触发方式（两种，均由你主动发起）：
+#   1. 打 desktop-v* tag 推上去（如 desktop-v0.1.0）
+#   2. Actions 页面手动 Run workflow，填版本号
+#
+# 产物：
+#   - Windows: .msi / .exe(NSIS)
+#   - macOS:   .dmg / .app（x86_64 + aarch64）
+#   - Linux:   .deb / .AppImage
+# 当前未配置代码签名（tauri.conf.json 里 signingIdentity / certificateThumbprint 为 null），
+# 用户下载后系统会提示“未签名/来自未知开发者”，属预期。需正式签名时再单独配置。
+
+on:
+  push:
+    tags:
+      - "desktop-v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号（如 desktop-v0.1.0），作为 Release 的 tag 名"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-desktop:
+    name: Build Desktop (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            name: linux-x86_64
+            args: ""
+          - os: windows-latest
+            name: windows-x86_64
+            args: ""
+          - os: macos-latest
+            name: macos-aarch64
+            args: "--target aarch64-apple-darwin"
+          - os: macos-latest
+            name: macos-x86_64
+            args: "--target x86_64-apple-darwin"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.name == 'macos-aarch64' && 'aarch64-apple-darwin' || matrix.name == 'macos-x86_64' && 'x86_64-apple-darwin' || '' }}
+
+      - name: Cache cargo (desktop)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.0-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Build and release desktop app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # desktop/src-tauri 是独立 workspace，需指明项目路径
+          projectPath: desktop
+          # tag 触发用 ref_name；手动触发用输入的 version
+          tagName: ${{ github.event.inputs.version || github.ref_name }}
+          releaseName: "Raven Desktop ${{ github.event.inputs.version || github.ref_name }}"
+          releaseBody: "桌面端安装包（未签名，首次打开需在系统中允许）。"
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}
