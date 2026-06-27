@@ -99,15 +99,23 @@ impl ConfigSystem {
         let content = std::fs::read_to_string(path).map_err(|e| format!("读取失败: {}", e))?;
 
         let file_cfg: Config = toml::from_str(&content).map_err(|e| format!("解析失败: {}", e))?;
+        // 同时解析成原始表，用「键是否存在」判断字段是否真的被写出，
+        // 避免「用户显式设成与默认值相同」被误当作未设置而丢弃。
+        let table: toml::Table =
+            toml::from_str(&content).map_err(|e| format!("解析失败: {}", e))?;
 
-        self.merge(file_cfg);
+        self.merge(file_cfg, &table);
         debug!("已加载配置: {}", path.display());
         Ok(())
     }
 
-    /// 合并配置（非空值覆盖）
-    fn merge(&mut self, other: Config) {
-        if !other.model.is_empty() && other.model != "gpt-4o" {
+    /// 合并配置。
+    ///
+    /// `present` 是同一文件解析出的原始 TOML 表，用于判断标量字段是否真的在
+    /// 文件中出现（而非 serde 填充的默认值）。列表/Option 字段本身可区分空与缺省，
+    /// 直接用值判断即可。
+    fn merge(&mut self, other: Config, present: &toml::Table) {
+        if present.contains_key("model") && !other.model.is_empty() {
             self.config.model = other.model;
         }
         if other.api_key.is_some() {
@@ -116,20 +124,30 @@ impl ConfigSystem {
         if other.base_url.is_some() {
             self.config.base_url = other.base_url;
         }
-        if other.log_level != "info" {
+        if present.contains_key("log_level") && !other.log_level.is_empty() {
             self.config.log_level = other.log_level;
         }
-        if other.token_budget > 0 {
+        if present.contains_key("token_budget") && other.token_budget > 0 {
             self.config.token_budget = other.token_budget;
         }
         if !other.providers.is_empty() {
-            self.config.providers.extend(other.providers);
+            // 用名称去重后合并：同名以新层为准，避免多层加载时重复堆积。
+            for p in other.providers {
+                if let Some(slot) = self.config.providers.iter_mut().find(|e| e.name == p.name) {
+                    *slot = p;
+                } else {
+                    self.config.providers.push(p);
+                }
+            }
         }
         // 深度合并
         self.merge_permission(other.permission);
         self.merge_context(other.context);
         self.merge_tools(other.tools);
-        self.merge_server(other.server);
+        self.merge_server(
+            other.server,
+            present.get("server").and_then(|v| v.as_table()),
+        );
     }
 
     fn merge_permission(&mut self, other: raven_types::PermissionConfig) {
@@ -168,11 +186,12 @@ impl ConfigSystem {
         }
     }
 
-    fn merge_server(&mut self, other: raven_types::ServerConfig) {
-        if !other.host.is_empty() && other.host != "0.0.0.0" {
+    fn merge_server(&mut self, other: raven_types::ServerConfig, present: Option<&toml::Table>) {
+        let has = |k: &str| present.map(|t| t.contains_key(k)).unwrap_or(false);
+        if has("host") && !other.host.is_empty() {
             self.config.server.host = other.host;
         }
-        if other.port > 0 && other.port != 8080 {
+        if has("port") && other.port > 0 {
             self.config.server.port = other.port;
         }
     }
