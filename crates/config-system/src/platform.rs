@@ -49,18 +49,14 @@ impl Platform {
     }
 
     /// 配置目录路径
+    ///
+    /// 所有平台统一使用 `~/.raven`（家目录下的 `.raven`），与配置加载
+    /// (`ConfigSystem::load`)、会话 (`session.rs`)、checkpoint (`checkpoint.rs`)、
+    /// 提示词模板 (`prompts.rs`) 的实际存储路径保持一致。Windows 上家目录由
+    /// `USERPROFILE` 决定（`dirs::home_dir()` 已处理），不再使用 `%APPDATA%`，
+    /// 避免配置写入 `~/.raven` 而此处却指向 `%APPDATA%\raven` 的路径分裂。
     pub fn config_dir(&self) -> std::path::PathBuf {
         match self {
-            Platform::Windows => {
-                // Windows: %APPDATA%\raven\ 或 %USERPROFILE%\.raven
-                if let Ok(appdata) = std::env::var("APPDATA") {
-                    std::path::PathBuf::from(appdata).join("raven")
-                } else if let Ok(home) = std::env::var("USERPROFILE") {
-                    std::path::PathBuf::from(home).join(".raven")
-                } else {
-                    std::path::PathBuf::from(".raven")
-                }
-            }
             Platform::Android => {
                 // Android Termux: $HOME/.raven
                 dirs::home_dir()
@@ -70,7 +66,7 @@ impl Platform {
                     })
             }
             _ => {
-                // Linux / macOS: ~/.raven
+                // Linux / macOS / Windows: ~/.raven
                 dirs::home_dir()
                     .map(|h| h.join(".raven"))
                     .unwrap_or_else(|| std::path::PathBuf::from(".raven"))
@@ -133,6 +129,19 @@ pub fn current() -> Platform {
     Platform::detect()
 }
 
+/// 当前 CPU 架构（用于平台信息与提示词占位符）
+pub fn arch() -> &'static str {
+    if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else if cfg!(target_arch = "arm") {
+        "arm"
+    } else {
+        "unknown"
+    }
+}
+
 /// 启用终端 ANSI 转义支持。
 ///
 /// 现代终端（Windows Terminal、conhost 较新版本）默认开启虚拟终端处理，
@@ -172,15 +181,7 @@ pub fn enable_ansi_support() {}
 /// 获取平台信息摘要
 pub fn info() -> String {
     let p = current();
-    let arch = if cfg!(target_arch = "x86_64") {
-        "x86_64"
-    } else if cfg!(target_arch = "aarch64") {
-        "aarch64"
-    } else if cfg!(target_arch = "arm") {
-        "arm"
-    } else {
-        "unknown"
-    };
+    let arch = arch();
 
     format!(
         "平台: {} ({}-{})\n配置目录: {}\nShell: {}\nTUI 支持: {}",

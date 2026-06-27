@@ -257,20 +257,46 @@ impl Agent {
         }
     }
 
-    /// 使用模板设置系统提示词
+    /// 应用环境感知的系统提示词。
+    ///
+    /// 以 `template`（模板名，None 用默认模板）为角色设定基底，
+    /// 自动拼接当前运行环境（OS / Shell / 工作目录）和可用工具清单，
+    /// 让模型据此选择平台正确的命令（如 Windows 用 `dir` 而非 `ls`）。
+    /// readonly 模式不列出工具（纯对话，模型拿不到工具）。
+    pub async fn apply_system_prompt(&self, template: Option<&str>) {
+        let base = template
+            .and_then(config_system::prompts::find_prompt)
+            .map(|t| t.prompt)
+            .unwrap_or_else(config_system::prompts::default_prompt);
+        let schemas = if self.permission.mode == "readonly" {
+            Vec::new()
+        } else {
+            self.collect_tool_schemas().await
+        };
+        let full = build_system_prompt(&base, &schemas);
+        self.context.set_system_prompt(full).await;
+    }
+
+    /// 使用模板设置系统提示词（同样附带环境与工具上下文）
     pub async fn set_prompt_template(&self, name: &str) -> Result<String, String> {
         match config_system::prompts::find_prompt(name) {
             Some(template) => {
-                self.context.set_system_prompt(template.prompt).await;
+                let schemas = if self.permission.mode == "readonly" {
+                    Vec::new()
+                } else {
+                    self.collect_tool_schemas().await
+                };
+                let full = build_system_prompt(&template.prompt, &schemas);
+                self.context.set_system_prompt(full).await;
                 Ok(format!(
                     "已切换提示词模板: {}\n{}",
                     template.name, template.description
                 ))
             }
             None => {
-                let available: Vec<String> = config_system::prompts::BUILTIN_PROMPTS
-                    .iter()
-                    .map(|p| p.name.to_string())
+                let available: Vec<String> = config_system::prompts::list_prompts()
+                    .into_iter()
+                    .map(|p| p.name)
                     .collect();
                 Err(format!(
                     "未知模板 '{}'. 可用: {}",
@@ -281,8 +307,8 @@ impl Agent {
         }
     }
 
-    /// 列出提示词模板
-    pub fn list_prompt_templates() -> &'static [config_system::prompts::PromptTemplate] {
+    /// 列出提示词模板（内置 + 用户自定义）
+    pub fn list_prompt_templates() -> Vec<config_system::prompts::PromptTemplate> {
         config_system::prompts::list_prompts()
     }
 
@@ -299,20 +325,25 @@ impl Agent {
             ));
         }
 
-        // 检查缓存（仅在单轮对话时有效）
-        let cache_key = ResponseCache::make_key(&self.config.model, &input);
+        // 添加用户消息
+        self.context.add_user_message(input).await;
+
+        // 基于「将要发送的完整消息列表」计算缓存键。
+        // 仅用最新输入会导致不同对话因末轮 user 文本相同而误命中，
+        // 故序列化全部消息（含历史）参与哈希。
+        let messages_for_key = self.context.messages().await;
+        let cache_key = ResponseCache::make_key(
+            &self.config.model,
+            &serde_json::to_string(&messages_for_key).unwrap_or_default(),
+        );
         if let Some(cached) = self.cache.get(&cache_key).await {
             debug!("缓存命中，跳过 API 调用");
-            self.context.add_user_message(input).await;
             self.context
                 .add_assistant_message(&cached.content, Vec::new())
                 .await;
-            self.context.record_usage(&cached.usage);
+            self.context.record_usage_async(&cached.usage).await;
             return Ok(cached.content);
         }
-
-        // 添加用户消息
-        self.context.add_user_message(input).await;
 
         loop {
             // 检查预算
@@ -343,7 +374,7 @@ impl Agent {
             };
 
             // 记录使用
-            self.context.record_usage(&resp.usage);
+            self.context.record_usage_async(&resp.usage).await;
 
             // 处理工具调用
             if !resp.tool_calls.is_empty() {
@@ -405,6 +436,13 @@ impl Agent {
 
         tokio::spawn(async move {
             loop {
+                // 下游接收端已关闭（SSE 客户端断开）时尽早退出，
+                // 避免继续空跑 LLM 调用与工具执行、白白消耗 API。
+                if tx.is_closed() {
+                    debug!("流式接收端已关闭，停止生成");
+                    return;
+                }
+
                 // 检查预算
                 if let Err(e) = context.check_budget() {
                     let _ = tx.send(StreamEvent::error(e.to_string())).await;
@@ -767,8 +805,10 @@ impl Agent {
 
             // Git-first: 编辑后自动 commit
             if is_file_edit && !result.is_error {
-                let desc = if result.content.len() > 30 {
-                    format!("{}...", &result.content[..30])
+                // 按字符截断，避免在多字节 UTF-8 字符（如中文）中间切断 panic
+                let desc = if result.content.chars().count() > 30 {
+                    let head: String = result.content.chars().take(30).collect();
+                    format!("{}...", head)
                 } else {
                     result.content.clone()
                 };
@@ -868,6 +908,80 @@ impl PermissionChecker {
             .await
             .insert(tool_name.to_string());
     }
+}
+
+/// 构建完整系统提示词：角色基底 + 运行环境上下文 + 可用工具清单。
+///
+/// 解决的问题：模型默认不知道自己跑在什么系统上，会在 Windows 下
+/// 调用 `pwd`/`ls` 这类 Unix 命令导致失败。这里把平台、Shell、工作目录、
+/// 以及每个工具的原始 name/description/参数拼进去，让模型据此决策。
+fn build_system_prompt(base: &str, schemas: &[ToolSchema]) -> String {
+    use config_system::platform;
+
+    let p = platform::current();
+    let cwd = std::env::current_dir()
+        .map(|d| d.display().to_string())
+        .unwrap_or_else(|_| "(未知)".to_string());
+
+    // 平台特定的命令约束，避免跨平台命令误用。给出"该用什么/不该用什么"的对照。
+    let shell_hint = match p {
+        platform::Platform::Windows => {
+            "本机是 Windows，shell 工具走 cmd.exe，只能用 Windows 命令，不要用 Unix 命令：\n\
+             - 列目录: 用 `dir`，不要用 `ls`\n\
+             - 当前目录: 用 `cd`，不要用 `pwd`\n\
+             - 删除文件: 用 `del`，不要用 `rm`\n\
+             - 查看文件: 用 `type`，不要用 `cat`\n\
+             - 路径分隔符是 `\\`（如 `crates\\cli\\src`）\n\
+             更推荐：读文件用 view，列目录用 list_dir，搜索用 search，改文件用 file_edit——\
+             这些内置工具跨平台一致，应优先于 shell 命令。"
+        }
+        _ => {
+            "本机是类 Unix 系统，shell 工具走 bash，可用 ls/cat/pwd/grep 等常见命令，\
+             路径分隔符是 `/`。更推荐：读文件用 view，列目录用 list_dir，搜索用 search，\
+             改文件用 file_edit——这些内置工具跨平台一致，应优先于 shell 命令。"
+        }
+    };
+
+    let mut out = String::with_capacity(base.len() + 768 + schemas.len() * 128);
+    // 第一段：基础提示词（先展开用户模板里的 {{os}}/{{shell}}/{{cwd}} 等环境占位符）
+    out.push_str(&config_system::prompts::expand_placeholders(base));
+
+    // 第二段：运行环境 + 命令约束
+    out.push_str("\n\n# 运行环境\n");
+    out.push_str("你正运行在以下环境中，所有命令和路径都必须与之匹配：\n");
+    out.push_str(&format!(
+        "- 操作系统: {} ({})\n",
+        p.name(),
+        platform::arch()
+    ));
+    out.push_str(&format!("- 默认 Shell: {}\n", p.default_shell()));
+    out.push_str(&format!("- 路径分隔符: {}\n", p.path_sep()));
+    out.push_str(&format!("- 工作目录: {}\n", cwd));
+    out.push('\n');
+    out.push_str(shell_hint);
+
+    // 第三段：可用工具
+    if !schemas.is_empty() {
+        out.push_str("\n\n# 可用工具\n");
+        out.push_str(
+            "你可以调用以下工具。每个工具的完整参数 schema 已随请求下发，\
+             调用时严格按 schema 提供 JSON 参数：\n\n",
+        );
+        for s in schemas {
+            let f = &s.function;
+            out.push_str(&format!("## {}\n{}\n", f.name, f.description));
+            // 列出参数名，方便模型直接对齐（完整 schema 已在 tool definition 中下发）
+            if let Some(props) = f.parameters.get("properties").and_then(|v| v.as_object()) {
+                let names: Vec<&str> = props.keys().map(|k| k.as_str()).collect();
+                if !names.is_empty() {
+                    out.push_str(&format!("参数: {}\n", names.join(", ")));
+                }
+            }
+            out.push('\n');
+        }
+    }
+
+    out
 }
 
 #[cfg(test)]
@@ -975,5 +1089,34 @@ mod tests {
         assert!(confirm::describe_tool("shell", &args).contains("rm file.txt"));
         let args = serde_json::json!({"path": "a.txt", "append": false});
         assert!(confirm::describe_tool("file_write", &args).contains("a.txt"));
+    }
+
+    #[test]
+    fn build_system_prompt_includes_env_and_tools() {
+        let schema = ToolSchema {
+            schema_type: "function".to_string(),
+            function: FunctionSchema {
+                name: "list_dir".to_string(),
+                description: "列出目录内容".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } }
+                }),
+            },
+        };
+        let out = build_system_prompt("你是助手", &[schema]);
+        assert!(out.starts_with("你是助手"));
+        assert!(out.contains("# 运行环境"));
+        assert!(out.contains("操作系统:"));
+        assert!(out.contains("# 可用工具"));
+        assert!(out.contains("list_dir"));
+        assert!(out.contains("参数: path"));
+    }
+
+    #[test]
+    fn build_system_prompt_omits_tools_when_empty() {
+        let out = build_system_prompt("base", &[]);
+        assert!(out.contains("# 运行环境"));
+        assert!(!out.contains("# 可用工具"));
     }
 }

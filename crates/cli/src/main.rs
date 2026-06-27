@@ -172,6 +172,10 @@ async fn init_agent() -> Arc<Agent> {
     // 注入终端确认器：ask 模式下执行敏感工具前实时询问 y/n/a
     agent.set_confirmer(Arc::new(raven_core::StdinConfirmer));
 
+    // 应用环境感知的系统提示词：拼接平台/Shell/工作目录 + 工具清单，
+    // 让模型在 Windows 下用 dir/cd 而非 pwd/ls。
+    agent.apply_system_prompt(None).await;
+
     Arc::new(agent)
 }
 
@@ -296,8 +300,8 @@ async fn cmd_chat_with_opening(opening: String) {
                         let mut val = String::new();
                         if std::io::stdin().read_line(&mut val).is_ok() {
                             let val = val.trim();
-                            let name = if let Ok(n) = val.parse::<usize>() {
-                                templates.get(n.saturating_sub(1)).map(|t| t.name)
+                            let name: Option<&str> = if let Ok(n) = val.parse::<usize>() {
+                                templates.get(n.saturating_sub(1)).map(|t| t.name.as_str())
                             } else {
                                 Some(val)
                             };
@@ -351,7 +355,16 @@ async fn cmd_single(message: String) {
 
     match agent.run(&message).await {
         Ok(response) => {
-            println!("{}", response);
+            // 用容错写入：下游管道提前关闭（如 `raven -p x | head`）时
+            // println! 会 panic，这里把 BrokenPipe 当作正常退出处理。
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            if let Err(e) = writeln!(out, "{}", response) {
+                if e.kind() == std::io::ErrorKind::BrokenPipe {
+                    return;
+                }
+            }
+            let _ = out.flush();
             eprintln!("\n[{}ms]", start.elapsed().as_millis());
         }
         Err(e) => {
@@ -982,7 +995,13 @@ fn save_config_value(path: &std::path::Path, key: &str, value: &str) {
     let _ = std::fs::write(path, updated);
 }
 
-/// 保存 [section] 下的配置项
+/// 保存 [section] 下的配置项。
+///
+/// 按行解析，避免手写字节切割的两个陷阱：
+/// 1. key 搜索若跨越整个文件，会误改后面 section 中的同名 key；这里把
+///    搜索范围限定在「本 section header 行之后、下一个 section header 行之前」。
+/// 2. 用 `find('[')` 找下一个 section 会被字符串值 / 数组里的 `[` 干扰；
+///    这里只认「去除前导空白后以 `[` 开头」的行作为 section 边界。
 fn save_config_section(path: &std::path::Path, section: &str, key: &str, value: &str) {
     let content = if path.exists() {
         std::fs::read_to_string(path).unwrap_or_default()
@@ -992,34 +1011,51 @@ fn save_config_section(path: &std::path::Path, section: &str, key: &str, value: 
 
     let section_header = format!("[{}]", section);
     let new_line = format!("{} = \"{}\"", key, value);
+    let key_prefix = format!("{} =", key);
+    let key_prefix_sp = format!("{}=", key);
 
-    let updated = if content.contains(&section_header) {
-        let section_start = content.find(&section_header).unwrap();
-        let after_header = &content[section_start + section_header.len()..];
+    let is_section_line = |line: &str| line.trim_start().starts_with('[');
+    let is_target_key = |line: &str| {
+        let t = line.trim_start();
+        t.starts_with(&key_prefix) || t.starts_with(&key_prefix_sp)
+    };
 
-        if let Some(key_pos) = after_header.find(&format!("{} = ", key)) {
-            let abs_key_pos = section_start + section_header.len() + key_pos;
-            let before = &content[..abs_key_pos];
-            let after_key = &content[abs_key_pos..];
-            if let Some(nl) = after_key.find('\n') {
-                format!(
-                    "{}{}\n{}",
-                    before,
-                    new_line,
-                    &content[abs_key_pos + nl + 1..]
-                )
-            } else {
-                format!("{}{}", before, new_line)
+    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+
+    // 定位本 section 的 header 行
+    let header_idx = lines.iter().position(|l| l.trim() == section_header.trim());
+
+    let updated = match header_idx {
+        Some(hidx) => {
+            // 本 section 范围：header 之后到下一个 section header（或文件末尾）
+            let mut end = lines.len();
+            for (i, line) in lines.iter().enumerate().skip(hidx + 1) {
+                if is_section_line(line) {
+                    end = i;
+                    break;
+                }
             }
-        } else {
-            let next_section = after_header.find('[').unwrap_or(after_header.len());
-            let insert_pos = section_start + section_header.len() + next_section;
-            let before = &content[..insert_pos];
-            let after = &content[insert_pos..];
-            format!("{}\n{}{}", before, new_line, after)
+            // 在范围内找已存在的 key
+            let existing = (hidx + 1..end).find(|&i| is_target_key(&lines[i]));
+            match existing {
+                Some(i) => {
+                    lines[i] = new_line;
+                }
+                None => {
+                    // 插到 section 末尾（end 之前），跳过尾随空行让排版更整齐
+                    let mut insert_at = end;
+                    while insert_at > hidx + 1 && lines[insert_at - 1].trim().is_empty() {
+                        insert_at -= 1;
+                    }
+                    lines.insert(insert_at, new_line);
+                }
+            }
+            lines.join("\n") + "\n"
         }
-    } else {
-        format!("{}\n{}\n{}\n", content.trim_end(), section_header, new_line)
+        None => {
+            // section 不存在，追加到文件末尾
+            format!("{}\n{}\n{}\n", content.trim_end(), section_header, new_line)
+        }
     };
 
     let _ = std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new(".")));

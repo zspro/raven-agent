@@ -79,9 +79,9 @@ impl Registry {
         }
     }
 
-    /// 获取工具（返回新实例）
+    /// 获取工具（返回新实例）。未知名称（含 MCP 工具）返回 None 而非 panic。
     pub fn get_tool(&self, name: &str) -> Option<Box<dyn Tool>> {
-        Some(builtin_tool_by_name(name))
+        builtin_tool_by_name(name)
     }
 
     /// 列出所有工具的 schema
@@ -140,9 +140,9 @@ impl Registry {
     }
 }
 
-/// 通过名称创建内置工具实例
-fn builtin_tool_by_name(name: &str) -> Box<dyn Tool> {
-    match name {
+/// 通过名称创建内置工具实例。未知名称返回 None（MCP 工具不在此列）。
+fn builtin_tool_by_name(name: &str) -> Option<Box<dyn Tool>> {
+    let tool: Box<dyn Tool> = match name {
         "file_read" => Box::new(FileReadTool),
         "file_write" => Box::new(FileWriteTool),
         "shell" => Box::new(ShellTool::default()),
@@ -153,6 +153,7 @@ fn builtin_tool_by_name(name: &str) -> Box<dyn Tool> {
         "view" => Box::new(ViewTool),
         "web_search" => Box::new(WebSearchTool),
         "fetch_url" => Box::new(FetchUrlTool),
-        _ => panic!("未知工具: {}", name),
-    }
+        _ => return None,
+    };
+    Some(tool)
 }
