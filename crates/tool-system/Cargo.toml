@@ -19,3 +19,6 @@ chrono = { workspace = true }
 reqwest = { workspace = true }
 regex = { workspace = true }
 urlencoding = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+encoding_rs = { workspace = true }

@@ -19,6 +19,11 @@ use tower_http::services::ServeDir;
 use tracing::info;
 
 /// 创建 API 路由
+///
+/// 注意：所有请求共享同一个 `Arc<Agent>`，因而共享同一份对话上下文与系统
+/// 提示词。这对「单用户本地 Agent」是预期行为（与 CLI/TUI 同源同会话）。
+/// 若未来要支持多租户隔离，需要按会话 ID 维护独立的 ContextManager，
+/// 而非在此处简单并发共享。
 pub fn create_routes(agent: Arc<Agent>) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)

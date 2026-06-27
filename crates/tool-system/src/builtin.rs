@@ -26,14 +26,13 @@ impl Tool for FileReadTool {
             schema_type: "function".to_string(),
             function: FunctionSchema {
                 name: "file_read".to_string(),
-                description: "读取指定文件的内容。支持文本文件。如果文件太大，会自动截断。"
-                    .to_string(),
+                description: "读取单个文本文件的内容，返回带行号的文本。\n\n通常优先使用 view（功能更全，文件和目录都能看）；仅在只想快速取某文件纯内容时用 file_read。大文件用 offset/limit 分段读取，避免一次拉取过多。".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "文件路径（相对或绝对）" },
-                        "offset": { "type": "integer", "description": "起始行号（可选，从0开始）" },
-                        "limit": { "type": "integer", "description": "最大读取行数（可选，默认100）" }
+                        "path": { "type": "string", "description": "文件路径（相对或绝对）。" },
+                        "offset": { "type": "integer", "description": "起始行号（可选，从 0 开始）。文件较大、想从中间读起时提供。" },
+                        "limit": { "type": "integer", "description": "最多读取的行数（可选，默认 100）。" }
                     },
                     "required": ["path"]
                 }),
@@ -54,7 +53,7 @@ impl Tool for FileReadTool {
 
         let lines: Vec<&str> = content.lines().collect();
         let start = offset.min(lines.len());
-        let end = (offset + limit).min(lines.len());
+        let end = offset.saturating_add(limit).min(lines.len());
 
         let selected: Vec<String> = lines[start..end]
             .iter()
@@ -91,13 +90,13 @@ impl Tool for FileWriteTool {
             schema_type: "function".to_string(),
             function: FunctionSchema {
                 name: "file_write".to_string(),
-                description: "写入内容到文件。如果文件存在会覆盖，除非 append=true。".to_string(),
+                description: "把内容整体写入文件，用于新建文件或完整重写。\n\n何时使用：创建全新文件，或文件需要从头重写时。\n何时不要用：修改已有文件的局部内容时改用 file_edit——它通过精确匹配替换，更安全、不会误删其余内容。默认会覆盖同名文件的全部内容，写之前先确认这是你想要的。".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "文件路径" },
-                        "content": { "type": "string", "description": "要写入的内容" },
-                        "append": { "type": "boolean", "description": "是否追加模式（默认false）" }
+                        "path": { "type": "string", "description": "目标文件路径（相对或绝对）。" },
+                        "content": { "type": "string", "description": "要写入的完整内容。" },
+                        "append": { "type": "boolean", "description": "true 表示追加到文件末尾，false（默认）表示覆盖整个文件。" }
                     },
                     "required": ["path", "content"]
                 }),
@@ -111,9 +110,16 @@ impl Tool for FileWriteTool {
         let append = args["append"].as_bool().unwrap_or(false);
 
         if append {
-            tokio::fs::write(path, content)
+            use tokio::io::AsyncWriteExt;
+            let mut f = tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
                 .await
-                .map_err(|e| format!("写入失败: {}", e))?;
+                .map_err(|e| format!("打开文件失败: {}", e))?;
+            f.write_all(content.as_bytes())
+                .await
+                .map_err(|e| format!("追加失败: {}", e))?;
         } else {
             tokio::fs::write(path, content)
                 .await
@@ -121,7 +127,12 @@ impl Tool for FileWriteTool {
         }
 
         let mode = if append { "追加" } else { "覆盖" };
-        Ok(format!("已{}写入 {} ({} 字符)", mode, path, content.len()))
+        Ok(format!(
+            "已{}写入 {} ({} 字符)",
+            mode,
+            path,
+            content.chars().count()
+        ))
     }
 }
 
@@ -174,25 +185,103 @@ fn default_shell_allowed() -> Vec<String> {
     cmds.iter().map(|s| s.to_string()).collect()
 }
 
+/// 将复合命令行切成多段，以便对每段的命令名分别做白名单校验。
+///
+/// 切分点包括：控制操作符 `&&`/`||`/`|`/`;`/`&`、换行符（`\n`/`\r`，shell 视为
+/// 命令分隔）、命令替换 `$(...)` 与反引号 `` `...` ``（内层也是一条待执行命令）。
+/// 引号（'...' / "..."）内的这些字符视为普通文本，不切分。这是语法上的保守切分，
+/// 不求完全等价于 shell 解析，但足以阻止"用首个安全命令绕过白名单"的情况
+/// （如 `echo ok && rm -rf /`、`echo ok$(curl evil)`、多行命令）。
+fn split_command_segments(command: &str) -> Vec<String> {
+    let mut segs = Vec::new();
+    let mut cur = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_single {
+            if c == '\'' {
+                in_single = false;
+            }
+            cur.push(c);
+            continue;
+        }
+        if in_double {
+            // 双引号内仍可能有命令替换 $(...) / 反引号，需切出内层命令校验
+            match c {
+                '"' => {
+                    in_double = false;
+                    cur.push(c);
+                }
+                '`' => segs.push(std::mem::take(&mut cur)),
+                '$' if chars.peek() == Some(&'(') => {
+                    chars.next();
+                    segs.push(std::mem::take(&mut cur));
+                }
+                _ => cur.push(c),
+            }
+            continue;
+        }
+        match c {
+            '\'' => {
+                in_single = true;
+                cur.push(c);
+            }
+            '"' => {
+                in_double = true;
+                cur.push(c);
+            }
+            // 命令替换：$( 开启一段内层命令
+            '$' if chars.peek() == Some(&'(') => {
+                chars.next();
+                segs.push(std::mem::take(&mut cur));
+            }
+            // 反引号、右括号也作分隔（反引号开/闭、$(...) 的闭合）
+            '`' | ')' => segs.push(std::mem::take(&mut cur)),
+            // 换行符：shell 视为命令分隔
+            '\n' | '\r' => segs.push(std::mem::take(&mut cur)),
+            '&' | '|' => {
+                // && / || / | / & 均为分隔符；连续两个一起吃掉
+                segs.push(std::mem::take(&mut cur));
+                if chars.peek() == Some(&c) {
+                    chars.next();
+                }
+            }
+            ';' => {
+                segs.push(std::mem::take(&mut cur));
+            }
+            _ => cur.push(c),
+        }
+    }
+    segs.push(cur);
+    segs
+}
+
 /// 危险命令黑名单：即使在白名单内也一律拒绝执行。
 /// 这是不可绕过的安全底线，防止破坏性操作。
 fn is_dangerous_command(command: &str) -> Option<&'static str> {
-    let lower = command.to_lowercase();
-    // 破坏性删除 / 磁盘操作 / 关机等
+    // 归一化：小写 + 把连续空白（含 tab/多空格）压成单个空格，
+    // 防止 `rm  -rf`（多空格）、`rm\t-rf` 绕过；首尾各补一个空格，
+    // 使带空格的模式能做"词边界"匹配（避免 `git add` 命中 `dd `）。
+    let collapsed = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lower = format!(" {} ", collapsed.to_lowercase());
+    // 破坏性删除 / 磁盘操作 / 关机等。短 token（rm/dd）用前后空格做词边界。
     const PATTERNS: &[(&str, &str)] = &[
-        ("rm -rf", "递归强制删除"),
-        ("rm -fr", "递归强制删除"),
-        ("rmdir /s", "递归删除目录"),
-        ("del /f", "强制删除"),
-        ("del /s", "递归删除"),
-        ("format ", "格式化磁盘"),
+        (" rm -rf", "递归强制删除"),
+        (" rm -fr", "递归强制删除"),
+        (" rm -r -f", "递归强制删除"),
+        (" rm -f -r", "递归强制删除"),
+        (" rmdir /s", "递归删除目录"),
+        (" del /f", "强制删除"),
+        (" del /s", "递归删除"),
+        (" format ", "格式化磁盘"),
         ("mkfs", "格式化文件系统"),
-        ("dd ", "磁盘块写入"),
+        (" dd ", "磁盘块写入"),
         (":(){", "fork 炸弹"),
         ("shutdown", "关机/重启"),
         ("reboot", "重启"),
         ("> /dev/sda", "覆写磁盘设备"),
-        ("chmod -r 777", "递归放开权限"),
+        (" chmod -r 777", "递归放开权限"),
         ("mkfs.", "格式化文件系统"),
     ];
     for (pat, reason) in PATTERNS {
@@ -201,6 +290,54 @@ fn is_dangerous_command(command: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// 将子进程输出的原始字节解码为字符串。
+///
+/// Windows 上输出编码不统一：内置命令（`dir`/`ver`/`systeminfo` 等）按当前
+/// 控制台输出码页（简体中文系统为 GBK/CP936）输出，而 `git`/`cargo`/`node`
+/// 以及 `type` 一个 UTF-8 文件时输出的是 UTF-8 字节。固定按某一种解码总会
+/// 把另一类弄成乱码。这里先做严格 UTF-8 解码：成功即说明是 UTF-8，直接用；
+/// 失败再按控制台码页解码。GBK 等多字节序列极少恰好构成合法 UTF-8，纯 ASCII
+/// 在两种编码下又完全一致，因此该启发式在实践中可靠。
+#[cfg(windows)]
+fn decode_console_bytes(bytes: &[u8]) -> String {
+    // 1. 优先 UTF-8（git/cargo/UTF-8 文件等）
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_string();
+    }
+    // 2. 退回控制台输出码页（dir/ver 等内置命令）
+    extern "system" {
+        fn GetConsoleOutputCP() -> u32;
+        fn GetOEMCP() -> u32;
+    }
+    // 安全：纯查询调用，无副作用。优先用控制台输出码页；
+    // 若进程未关联控制台（返回 0），回退到系统 OEM 码页。
+    let cp = unsafe {
+        let c = GetConsoleOutputCP();
+        if c == 0 {
+            GetOEMCP()
+        } else {
+            c
+        }
+    };
+    let encoding = match cp {
+        65001 => encoding_rs::UTF_8,
+        936 => encoding_rs::GBK,
+        950 => encoding_rs::BIG5,
+        932 => encoding_rs::SHIFT_JIS,
+        949 => encoding_rs::EUC_KR,
+        1252 => encoding_rs::WINDOWS_1252,
+        _ => encoding_rs::UTF_8,
+    };
+    let (cow, _, _) = encoding.decode(bytes);
+    cow.into_owned()
+}
+
+/// 将子进程输出的原始字节解码为字符串（非 Windows：按 UTF-8 处理）。
+#[cfg(not(windows))]
+fn decode_console_bytes(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
 #[async_trait]
@@ -218,13 +355,12 @@ impl Tool for ShellTool {
             function: FunctionSchema {
                 name: "shell".to_string(),
                 description:
-                    "执行 Shell 命令。支持常用命令如 ls、cat、grep、find、git 等。超时 30 秒。"
-                        .to_string(),
+                    "在本机默认 shell 中执行一条命令（Windows 走 cmd.exe，类 Unix 走 sh），并返回标准输出。\n\n何时使用：运行构建/测试、调用 git 之外的命令行工具等内置工具覆盖不到的操作。\n何时不要用：读文件、列目录、搜索内容时优先用 view / list_dir / search——它们跨平台一致，不受当前系统命令差异影响（例如 Windows 上没有 ls/pwd）。\n\n约束：仅允许白名单内的命令；破坏性命令（递归删除、磁盘格式化、关机等）一律拒绝；默认超时 30 秒。请按本机操作系统选择正确的命令。".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "command": { "type": "string", "description": "要执行的命令" },
-                        "timeout": { "type": "integer", "description": "超时秒数（默认30）" }
+                        "command": { "type": "string", "description": "要执行的完整命令行。命令名（首个词）须在允许列表内，且需匹配本机系统（如 Windows 用 dir 而非 ls）。" },
+                        "timeout": { "type": "integer", "description": "超时秒数（可选，默认 30）。" }
                     },
                     "required": ["command"]
                 }),
@@ -244,14 +380,20 @@ impl Tool for ShellTool {
             ));
         }
 
-        // 白名单检查：取首个 token 作为命令名
-        let cmd = command.split_whitespace().next().unwrap_or("");
-        if !self.allowed.iter().any(|c| c == cmd) {
-            return Err(format!(
-                "命令 '{}' 不在允许列表中。\n可在配置 'tools.shell.allowed' 中添加，当前允许: {}",
-                cmd,
-                self.allowed.join(", ")
-            ));
+        // 白名单检查：复合命令（&&、||、|、;、& 连接）按每段命令名分别校验，
+        // 防止 `echo ok && rm -rf /` 这类用首个安全命令绕过白名单的情况。
+        for seg in split_command_segments(command) {
+            let cmd = seg.split_whitespace().next().unwrap_or("");
+            if cmd.is_empty() {
+                continue;
+            }
+            if !self.allowed.iter().any(|c| c == cmd) {
+                return Err(format!(
+                    "命令 '{}' 不在允许列表中。\n可在配置 'tools.shell.allowed' 中添加，当前允许: {}",
+                    cmd,
+                    self.allowed.join(", ")
+                ));
+            }
         }
 
         let output = tokio::time::timeout(std::time::Duration::from_secs(timeout), {
@@ -274,17 +416,18 @@ impl Tool for ShellTool {
         .map_err(|_| "命令超时")?
         .map_err(|e| format!("执行失败: {}", e))?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = decode_console_bytes(&output.stdout);
+        let stderr = decode_console_bytes(&output.stderr);
 
         if !output.status.success() {
-            return Err(format!("exit code: {}\n{}", output.status, stderr));
+            // status 的 Display 在各平台已含 "exit code: N"，不再重复前缀
+            return Err(format!("{}\n{}", output.status, stderr));
         }
 
         if !stderr.is_empty() {
             Ok(format!("{}\n[stderr]: {}", stdout, stderr))
         } else {
-            Ok(stdout.to_string())
+            Ok(stdout)
         }
     }
 }
@@ -309,14 +452,14 @@ impl Tool for SearchTool {
             schema_type: "function".to_string(),
             function: FunctionSchema {
                 name: "search".to_string(),
-                description: "在指定目录的文件中搜索匹配的内容。支持正则表达式。".to_string(),
+                description: "在目录下递归搜索文件内容中匹配正则的行，返回 文件:行号:内容。跨平台纯 Rust 实现，大小写不敏感，自动跳过 .git/target/node_modules 等噪音目录。\n\n何时使用：在代码库中按关键字/正则定位定义、引用或字符串。\n何时不要用：已知确切路径、只想看某个文件时用 view。结果较多时用 ext 限定文件类型、用 max_results 收口。".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "pattern": { "type": "string", "description": "搜索模式" },
-                        "path": { "type": "string", "description": "搜索目录（默认当前目录）" },
-                        "ext": { "type": "string", "description": "文件扩展名过滤（如.go,.js，可选）" },
-                        "max_results": { "type": "integer", "description": "最大结果数（默认20）" }
+                        "pattern": { "type": "string", "description": "搜索用的正则表达式。" },
+                        "path": { "type": "string", "description": "搜索起始目录（可选，默认当前目录）。" },
+                        "ext": { "type": "string", "description": "按扩展名过滤（可选，如 .rs、.go；带不带点都可）。" },
+                        "max_results": { "type": "integer", "description": "最多返回的匹配数（可选，默认 20）。" }
                     },
                     "required": ["pattern"]
                 }),
@@ -432,11 +575,11 @@ impl Tool for ListDirTool {
             schema_type: "function".to_string(),
             function: FunctionSchema {
                 name: "list_dir".to_string(),
-                description: "列出指定目录中的文件和子目录。".to_string(),
+                description: "列出某个目录下的直接子目录和文件（含文件大小）。跨平台，优先于 shell 的 ls/dir 使用。\n\n何时使用：快速了解某一层目录里有什么。要递归查看整棵树或同时看文件内容时，改用 view。".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "目录路径（默认当前目录）" }
+                        "path": { "type": "string", "description": "目录路径（可选，默认当前目录）。" }
                     }
                 }),
             },
@@ -513,13 +656,12 @@ impl Tool for GitTool {
             function: FunctionSchema {
                 name: "git".to_string(),
                 description:
-                    "执行 Git 命令。支持 status、log、diff、branch 等只读操作，以及 commit。"
-                        .to_string(),
+                    "执行 Git 操作。支持只读查询（status、log、diff、branch、show、blame、remote、config）以及写操作（add、commit、init）。\n\n何时使用：查看仓库状态/历史/差异，或在用户要求时暂存与提交。\n注意：仅在用户明确要求时才创建提交；commit 前先用 status/diff 确认改动范围。不要自行改动 git 配置。".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "command": { "type": "string", "description": "Git 子命令（如 status, log, diff, branch, commit）" },
-                        "args": { "type": "string", "description": "额外参数" }
+                        "command": { "type": "string", "description": "Git 子命令，取值之一：status、log、diff、branch、show、blame、remote、config、add、commit、init。" },
+                        "args": { "type": "string", "description": "传给该子命令的额外参数（可选，按空格分隔），如 commit 的 -m \"信息\"。" }
                     },
                     "required": ["command"]
                 }),
@@ -543,7 +685,7 @@ impl Tool for GitTool {
         let mut cmd = tokio::process::Command::new("git");
         cmd.arg(command);
         if !extra.is_empty() {
-            cmd.args(extra.split_whitespace());
+            cmd.args(tokenize_args(extra));
         }
 
         let output = cmd
@@ -551,19 +693,55 @@ impl Tool for GitTool {
             .await
             .map_err(|e| format!("git 执行失败: {}", e))?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = decode_console_bytes(&output.stdout);
+        let stderr = decode_console_bytes(&output.stderr);
 
         if !output.status.success() {
-            return Err(format!("{}", stderr));
+            return Err(stderr);
         }
 
         Ok(if stderr.is_empty() {
-            stdout.to_string()
+            stdout
         } else {
             format!("{}\n[stderr]: {}", stdout, stderr)
         })
     }
+}
+
+/// 把参数字符串拆成 argv，尊重单/双引号（引号内空格不切分），引号本身被剥除。
+/// 这样 `commit -m "提交信息"` 会得到 `["-m", "提交信息"]`，而不是被空格切碎。
+fn tokenize_args(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut has_token = false;
+    for c in s.chars() {
+        match c {
+            '\'' if !in_double => {
+                in_single = !in_single;
+                has_token = true;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                has_token = true;
+            }
+            c if c.is_whitespace() && !in_single && !in_double => {
+                if has_token {
+                    out.push(std::mem::take(&mut cur));
+                    has_token = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                has_token = true;
+            }
+        }
+    }
+    if has_token {
+        out.push(cur);
+    }
+    out
 }
 
 // =============================================================================
@@ -632,6 +810,35 @@ mod tests {
         let tool = ShellTool::with_config(vec!["ls".to_string()], 30);
         let res = tool
             .execute(serde_json::json!({"command": "wget http://x"}))
+            .await;
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("不在允许列表"));
+    }
+
+    #[test]
+    fn test_split_command_segments() {
+        assert_eq!(split_command_segments("ls"), vec!["ls"]);
+        assert_eq!(
+            split_command_segments("echo ok && rm -rf /"),
+            vec!["echo ok ", " rm -rf /"]
+        );
+        assert_eq!(
+            split_command_segments("a | b ; c & d || e"),
+            vec!["a ", " b ", " c ", " d ", " e"]
+        );
+        // 引号内的操作符不切分
+        assert_eq!(
+            split_command_segments("echo \"a && b\""),
+            vec!["echo \"a && b\""]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shell_rejects_compound_bypass() {
+        // 首段安全（echo 在默认集），但第二段不在白名单，应整体拒绝
+        let tool = ShellTool::with_config(vec!["echo".to_string()], 30);
+        let res = tool
+            .execute(serde_json::json!({"command": "echo ok && wget http://x"}))
             .await;
         assert!(res.is_err());
         assert!(res.unwrap_err().contains("不在允许列表"));
