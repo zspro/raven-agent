@@ -1,6 +1,9 @@
 //! 交互式设置界面与配置文件写入
 
-use crate::config_io::{save_config_section, save_config_value, save_full_config, truncate_24};
+use crate::config_io::{
+    save_config_section, save_config_section_raw, save_config_value, save_config_value_raw,
+    save_full_config, truncate_24,
+};
 
 /// 交互式设置界面（类似 Claude Code 的 /settings）
 pub(crate) async fn cmd_settings(agent: &raven_core::Agent) {
@@ -72,11 +75,44 @@ pub(crate) async fn cmd_settings(agent: &raven_core::Agent) {
         println!("║  11. 管理提供商 ({}个)          ║", cfg.providers.len());
         println!("║  12. Git-first: {:22} ║", git_first_status);
         println!("║                                        ║");
+        let mp = &cfg.model_params;
+        let fmt_opt_f = |v: Option<f32>| v.map(|x| x.to_string()).unwrap_or_else(|| "默认".into());
+        let fmt_opt_u = |v: Option<u32>| v.map(|x| x.to_string()).unwrap_or_else(|| "默认".into());
+        println!("║  [模型参数]                            ║");
+        println!("║  13. temperature: {:20} ║", fmt_opt_f(mp.temperature));
+        println!("║  14. max_tokens:  {:20} ║", fmt_opt_u(mp.max_tokens));
+        println!("║  15. top_p:       {:20} ║", fmt_opt_f(mp.top_p));
+        println!(
+            "║  16. freq_penalty:{:20} ║",
+            fmt_opt_f(mp.frequency_penalty)
+        );
+        println!(
+            "║  17. pres_penalty:{:20} ║",
+            fmt_opt_f(mp.presence_penalty)
+        );
+        println!("║                                        ║");
+        println!("║  [界面]                                ║");
+        let preview_display = if cfg.tui.preview_lines == 0 {
+            "不折叠".to_string()
+        } else {
+            format!("{} 行", cfg.tui.preview_lines)
+        };
+        println!("║  18. 工具输出折叠: {:19} ║", preview_display);
+        println!("║                                        ║");
+        let api = &cfg.api;
+        println!("║  [API]                                 ║");
+        println!("║  19. 请求超时: {}s{:20} ║", api.timeout, "");
+        println!("║  20. 重试次数: {:23} ║", api.max_retries);
+        println!(
+            "║  21. 流式输出: {:23} ║",
+            if api.stream { "开启" } else { "关闭" }
+        );
+        println!("║                                        ║");
         println!("║  s. 保存完整配置                       ║");
         println!("║  d. 诊断检查                           ║");
         println!("║  q. 返回                               ║");
         println!("╚════════════════════════════════════════╝");
-        print!("\n选择要修改的项 (1-7, s, q): ");
+        print!("\n选择要修改的项 (1-21, s, q): ");
         std::io::stdout().flush().unwrap();
 
         let mut choice = String::new();
@@ -185,7 +221,7 @@ pub(crate) async fn cmd_settings(agent: &raven_core::Agent) {
                             .map(|s| format!("\"{}\"", s))
                             .collect::<Vec<_>>()
                             .join(", ");
-                        save_config_section(
+                        save_config_section_raw(
                             &config_path,
                             "permission",
                             "allowed_tools",
@@ -204,7 +240,7 @@ pub(crate) async fn cmd_settings(agent: &raven_core::Agent) {
                     let val = val.trim();
                     if let Ok(n) = val.parse::<usize>() {
                         if n >= 4096 {
-                            save_config_section(
+                            save_config_section_raw(
                                 &config_path,
                                 "context",
                                 "max_tokens",
@@ -226,7 +262,7 @@ pub(crate) async fn cmd_settings(agent: &raven_core::Agent) {
                 if std::io::stdin().read_line(&mut val).is_ok() {
                     let val = val.trim();
                     if let Ok(n) = val.parse::<usize>() {
-                        save_config_section(
+                        save_config_section_raw(
                             &config_path,
                             "context",
                             "compact_threshold",
@@ -245,7 +281,12 @@ pub(crate) async fn cmd_settings(agent: &raven_core::Agent) {
                 if std::io::stdin().read_line(&mut val).is_ok() {
                     let val = val.trim();
                     if let Ok(n) = val.parse::<usize>() {
-                        save_config_section(&config_path, "context", "keep_rounds", &n.to_string());
+                        save_config_section_raw(
+                            &config_path,
+                            "context",
+                            "keep_rounds",
+                            &n.to_string(),
+                        );
                         println!("✓ 已保存，重启后生效");
                     } else if !val.is_empty() {
                         println!("✗ 无效的数字");
@@ -259,7 +300,7 @@ pub(crate) async fn cmd_settings(agent: &raven_core::Agent) {
                 if std::io::stdin().read_line(&mut val).is_ok() {
                     let val = val.trim();
                     if let Ok(n) = val.parse::<usize>() {
-                        save_config_value(&config_path, "token_budget", &n.to_string());
+                        save_config_value_raw(&config_path, "token_budget", &n.to_string());
                         println!("✓ 已保存，重启后生效");
                     } else if !val.is_empty() {
                         println!("✗ 无效的数字");
@@ -310,21 +351,185 @@ pub(crate) async fn cmd_settings(agent: &raven_core::Agent) {
                 if std::io::stdin().read_line(&mut val).is_ok() {
                     match val.trim() {
                         "1" => {
-                            save_config_section(&config_path, "git_first", "enabled", "true");
-                            save_config_section(&config_path, "git_first", "auto_commit", "true");
+                            save_config_section_raw(&config_path, "git_first", "enabled", "true");
+                            save_config_section_raw(
+                                &config_path,
+                                "git_first",
+                                "auto_commit",
+                                "true",
+                            );
                             println!("✓ Git-first 已开启（自动提交），退出设置后生效");
                         }
                         "2" => {
-                            save_config_section(&config_path, "git_first", "enabled", "true");
-                            save_config_section(&config_path, "git_first", "auto_commit", "false");
+                            save_config_section_raw(&config_path, "git_first", "enabled", "true");
+                            save_config_section_raw(
+                                &config_path,
+                                "git_first",
+                                "auto_commit",
+                                "false",
+                            );
                             println!("✓ Git-first 已开启（手动提交），退出设置后生效");
                         }
                         "3" => {
-                            save_config_section(&config_path, "git_first", "enabled", "false");
-                            save_config_section(&config_path, "git_first", "auto_commit", "false");
+                            save_config_section_raw(&config_path, "git_first", "enabled", "false");
+                            save_config_section_raw(
+                                &config_path,
+                                "git_first",
+                                "auto_commit",
+                                "false",
+                            );
                             println!("✓ Git-first 已关闭，退出设置后生效");
                         }
                         _ => println!("无效选择"),
+                    }
+                }
+            }
+            // ---- 模型参数 ----
+            "13" => {
+                read_model_param_f32(
+                    &config_path,
+                    "temperature",
+                    "采样温度 (0~2，越高越随机)",
+                    cfg.model_params.temperature,
+                    0.0,
+                    2.0,
+                );
+            }
+            "14" => {
+                print!(
+                    "输入 max_tokens 单次最大生成 (当前: {}): ",
+                    cfg.model_params
+                        .max_tokens
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "默认".into())
+                );
+                std::io::stdout().flush().unwrap();
+                let mut val = String::new();
+                if std::io::stdin().read_line(&mut val).is_ok() {
+                    let val = val.trim();
+                    if let Ok(n) = val.parse::<u32>() {
+                        if n > 0 {
+                            save_config_section_raw(
+                                &config_path,
+                                "model_params",
+                                "max_tokens",
+                                &n.to_string(),
+                            );
+                            println!("✓ 已保存，退出设置后生效");
+                        } else {
+                            println!("✗ 必须 > 0");
+                        }
+                    } else if !val.is_empty() {
+                        println!("✗ 无效的数字");
+                    }
+                }
+            }
+            "15" => {
+                read_model_param_f32(
+                    &config_path,
+                    "top_p",
+                    "核采样 top_p (0~1)",
+                    cfg.model_params.top_p,
+                    0.0,
+                    1.0,
+                );
+            }
+            "16" => {
+                read_model_param_f32(
+                    &config_path,
+                    "frequency_penalty",
+                    "频率惩罚 (-2~2)",
+                    cfg.model_params.frequency_penalty,
+                    -2.0,
+                    2.0,
+                );
+            }
+            "17" => {
+                read_model_param_f32(
+                    &config_path,
+                    "presence_penalty",
+                    "存在惩罚 (-2~2)",
+                    cfg.model_params.presence_penalty,
+                    -2.0,
+                    2.0,
+                );
+            }
+            // ---- 界面 ----
+            "18" => {
+                print!(
+                    "工具输出折叠行数 (0=不折叠, 当前: {}): ",
+                    cfg.tui.preview_lines
+                );
+                std::io::stdout().flush().unwrap();
+                let mut val = String::new();
+                if std::io::stdin().read_line(&mut val).is_ok() {
+                    let val = val.trim();
+                    if let Ok(n) = val.parse::<usize>() {
+                        save_config_section_raw(
+                            &config_path,
+                            "tui",
+                            "preview_lines",
+                            &n.to_string(),
+                        );
+                        println!("✓ 已保存，退出设置后生效");
+                    } else if !val.is_empty() {
+                        println!("✗ 无效的数字");
+                    }
+                }
+            }
+            // ---- API ----
+            "19" => {
+                print!("请求超时秒数 (当前: {}): ", cfg.api.timeout);
+                std::io::stdout().flush().unwrap();
+                let mut val = String::new();
+                if std::io::stdin().read_line(&mut val).is_ok() {
+                    let val = val.trim();
+                    if let Ok(n) = val.parse::<u64>() {
+                        if n > 0 {
+                            save_config_section_raw(&config_path, "api", "timeout", &n.to_string());
+                            println!("✓ 已保存，退出设置后生效");
+                        } else {
+                            println!("✗ 必须 > 0");
+                        }
+                    } else if !val.is_empty() {
+                        println!("✗ 无效的数字");
+                    }
+                }
+            }
+            "20" => {
+                print!("失败重试次数 (0=不重试, 当前: {}): ", cfg.api.max_retries);
+                std::io::stdout().flush().unwrap();
+                let mut val = String::new();
+                if std::io::stdin().read_line(&mut val).is_ok() {
+                    let val = val.trim();
+                    if let Ok(n) = val.parse::<u32>() {
+                        save_config_section_raw(&config_path, "api", "max_retries", &n.to_string());
+                        println!("✓ 已保存，退出设置后生效");
+                    } else if !val.is_empty() {
+                        println!("✗ 无效的数字");
+                    }
+                }
+            }
+            "21" => {
+                println!("流式输出 (SSE)：开启=逐字显示；关闭=整段返回（兼容不支持流式的端点）");
+                print!(
+                    "输入 on 开启 / off 关闭 (当前: {}): ",
+                    if cfg.api.stream { "开启" } else { "关闭" }
+                );
+                std::io::stdout().flush().unwrap();
+                let mut val = String::new();
+                if std::io::stdin().read_line(&mut val).is_ok() {
+                    match val.trim().to_lowercase().as_str() {
+                        "on" | "true" | "1" | "开启" => {
+                            save_config_section_raw(&config_path, "api", "stream", "true");
+                            println!("✓ 流式已开启，退出设置后生效");
+                        }
+                        "off" | "false" | "0" | "关闭" => {
+                            save_config_section_raw(&config_path, "api", "stream", "false");
+                            println!("✓ 流式已关闭，退出设置后生效");
+                        }
+                        "" => {}
+                        _ => println!("✗ 请输入 on 或 off"),
                     }
                 }
             }
@@ -341,7 +546,7 @@ pub(crate) async fn cmd_settings(agent: &raven_core::Agent) {
                 }
             }
             "q" | "Q" | "" => break,
-            _ => println!("无效选择，请输入 1-12, s, d, q"),
+            _ => println!("无效选择，请输入 1-21, s, d, q"),
         }
     }
 
@@ -357,6 +562,38 @@ pub(crate) async fn cmd_settings(agent: &raven_core::Agent) {
                 "\x1b[33m配置重新加载失败（{}），改动将在下次启动生效。\x1b[0m",
                 e
             );
+        }
+    }
+}
+
+/// 读取一个 f32 模型参数并写入 `[model_params]`（带范围校验）。空输入保持不变。
+fn read_model_param_f32(
+    config_path: &std::path::Path,
+    key: &str,
+    desc: &str,
+    current: Option<f32>,
+    min: f32,
+    max: f32,
+) {
+    use std::io::Write;
+    let cur = current
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "默认".into());
+    print!("输入 {} (当前: {}): ", desc, cur);
+    std::io::stdout().flush().unwrap();
+    let mut val = String::new();
+    if std::io::stdin().read_line(&mut val).is_ok() {
+        let val = val.trim();
+        if val.is_empty() {
+            return;
+        }
+        match val.parse::<f32>() {
+            Ok(n) if n >= min && n <= max => {
+                save_config_section_raw(config_path, "model_params", key, &n.to_string());
+                println!("✓ 已保存，退出设置后生效");
+            }
+            Ok(_) => println!("✗ 超出范围 [{}, {}]", min, max),
+            Err(_) => println!("✗ 无效的数字"),
         }
     }
 }
@@ -462,12 +699,14 @@ models = [{}]
                 std::io::stdin().read_line(&mut num).unwrap();
                 if let Ok(n) = num.trim().parse::<usize>() {
                     if n > 0 && n <= cfg.providers.len() {
-                        println!("删除提供商 '{}'，退出设置后生效", cfg.providers[n - 1].name);
-                        // 注：简单实现是让用户手动编辑文件
-                        println!(
-                            "(请手动编辑 {} 删除对应 [[providers]] 段)",
-                            config_path.display()
-                        );
+                        let name = &cfg.providers[n - 1].name;
+                        if remove_provider_block(config_path, name) {
+                            println!("✓ 提供商 '{}' 已删除，退出设置后生效", name);
+                        } else {
+                            println!("✗ 未在配置文件中找到 '{}' 对应的段", name);
+                        }
+                    } else {
+                        println!("✗ 编号超出范围");
                     }
                 }
             }
@@ -475,4 +714,51 @@ models = [{}]
             _ => {}
         }
     }
+}
+
+/// 从配置文件中删除 name 匹配的 `[[providers]]` 段。删除成功返回 true。
+///
+/// 按行扫描：定位每个 `[[providers]]` header，在其块内（到下一个以 `[` 开头的
+/// section/数组表 header 或文件末尾）查找 `name = "<目标>"`，命中则连 header 一并删除。
+/// 只删第一个匹配，避免误删同名块以外的内容。
+fn remove_provider_block(path: &std::path::Path, target: &str) -> bool {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    let is_section = |l: &str| l.trim_start().starts_with('[');
+
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim() == "[[providers]]" {
+            // 该块范围：header 之后到下一个 section header（或文件末尾）
+            let mut end = lines.len();
+            for (j, l) in lines.iter().enumerate().skip(i + 1) {
+                if is_section(l) {
+                    end = j;
+                    break;
+                }
+            }
+            // 块内匹配 name
+            let matched = (i + 1..end).any(|k| {
+                let t = lines[k].trim();
+                t.starts_with("name") && t.contains(&format!("\"{}\"", target))
+            });
+            if matched {
+                let mut kept: Vec<&str> = Vec::new();
+                kept.extend_from_slice(&lines[..i]);
+                kept.extend_from_slice(&lines[end..]);
+                let mut out = kept.join("\n");
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                return std::fs::write(path, out).is_ok();
+            }
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    false
 }

@@ -11,13 +11,22 @@ pub(crate) fn truncate_24(s: &str) -> String {
 
 /// 保存顶层配置项
 pub(crate) fn save_config_value(path: &std::path::Path, key: &str, value: &str) {
+    write_top_level(path, key, &format!("{} = \"{}\"", key, value));
+}
+
+/// 保存顶层**非字符串**配置项（数字 / 布尔），值不加引号。
+pub(crate) fn save_config_value_raw(path: &std::path::Path, key: &str, value: &str) {
+    write_top_level(path, key, &format!("{} = {}", key, value));
+}
+
+/// 顶层 key 的写入/替换（new_line 已格式化好）。
+fn write_top_level(path: &std::path::Path, key: &str, new_line: &str) {
     let content = if path.exists() {
         std::fs::read_to_string(path).unwrap_or_default()
     } else {
         String::new()
     };
 
-    let new_line = format!("{} = \"{}\"", key, value);
     let updated = if let Some(pos) = content.find(&format!("{} = ", key)) {
         let before = &content[..pos];
         let after_start = &content[pos..];
@@ -36,14 +45,32 @@ pub(crate) fn save_config_value(path: &std::path::Path, key: &str, value: &str) 
     let _ = std::fs::write(path, updated);
 }
 
-/// 保存 [section] 下的配置项。
+/// 保存 [section] 下的字符串配置项（值会加引号）。
+pub(crate) fn save_config_section(path: &std::path::Path, section: &str, key: &str, value: &str) {
+    write_section_line(path, section, key, &format!("{} = \"{}\"", key, value));
+}
+
+/// 保存 [section] 下的**非字符串**配置项（数字 / 布尔 / 数组）。
+///
+/// 值原样写入，不加引号——否则 `max_tokens = "64000"` 会被 serde 当作字符串
+/// 解析失败而回退默认值（这是之前数值/数组项写错引号的根因）。
+pub(crate) fn save_config_section_raw(
+    path: &std::path::Path,
+    section: &str,
+    key: &str,
+    value: &str,
+) {
+    write_section_line(path, section, key, &format!("{} = {}", key, value));
+}
+
+/// 在 [section] 下写入/替换一整行 `new_line`（已含 key 与格式化好的值）。
 ///
 /// 按行解析，避免手写字节切割的两个陷阱：
 /// 1. key 搜索若跨越整个文件，会误改后面 section 中的同名 key；这里把
 ///    搜索范围限定在「本 section header 行之后、下一个 section header 行之前」。
 /// 2. 用 `find('[')` 找下一个 section 会被字符串值 / 数组里的 `[` 干扰；
 ///    这里只认「去除前导空白后以 `[` 开头」的行作为 section 边界。
-pub(crate) fn save_config_section(path: &std::path::Path, section: &str, key: &str, value: &str) {
+fn write_section_line(path: &std::path::Path, section: &str, key: &str, new_line: &str) {
     let content = if path.exists() {
         std::fs::read_to_string(path).unwrap_or_default()
     } else {
@@ -51,7 +78,6 @@ pub(crate) fn save_config_section(path: &std::path::Path, section: &str, key: &s
     };
 
     let section_header = format!("[{}]", section);
-    let new_line = format!("{} = \"{}\"", key, value);
     let key_prefix = format!("{} =", key);
     let key_prefix_sp = format!("{}=", key);
 
@@ -80,7 +106,7 @@ pub(crate) fn save_config_section(path: &std::path::Path, section: &str, key: &s
             let existing = (hidx + 1..end).find(|&i| is_target_key(&lines[i]));
             match existing {
                 Some(i) => {
-                    lines[i] = new_line;
+                    lines[i] = new_line.to_string();
                 }
                 None => {
                     // 插到 section 末尾（end 之前），跳过尾随空行让排版更整齐
@@ -88,7 +114,7 @@ pub(crate) fn save_config_section(path: &std::path::Path, section: &str, key: &s
                     while insert_at > hidx + 1 && lines[insert_at - 1].trim().is_empty() {
                         insert_at -= 1;
                     }
-                    lines.insert(insert_at, new_line);
+                    lines.insert(insert_at, new_line.to_string());
                 }
             }
             lines.join("\n") + "\n"

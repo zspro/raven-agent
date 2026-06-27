@@ -14,8 +14,8 @@ use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use raven_types::{
-    ChatResponse, Message, ModelInfo, ProviderConfig, Role, StreamEvent, TokenUsage, ToolCall,
-    ToolCallFunction, ToolSchema,
+    ApiConfig, ChatResponse, Message, ModelConfig, ModelInfo, ProviderConfig, Role, StreamEvent,
+    TokenUsage, ToolCall, ToolCallFunction, ToolSchema,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -24,15 +24,19 @@ use tracing::{debug, error, trace};
 
 pub struct GeminiClient {
     config: ProviderConfig,
+    params: ModelConfig,
+    max_retries: u32,
     http: reqwest::Client,
 }
 
 impl GeminiClient {
-    pub fn new(config: ProviderConfig) -> Self {
+    pub fn new(config: ProviderConfig, params: ModelConfig, api: ApiConfig) -> Self {
         Self {
             config,
+            params,
+            max_retries: api.max_retries,
             http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
+                .timeout(std::time::Duration::from_secs(api.timeout))
                 .build()
                 .unwrap(),
         }
@@ -143,6 +147,26 @@ impl GeminiClient {
                 body["tools"] = Self::convert_tools(ts);
             }
         }
+        // generationConfig：仅在有配置时下发对应字段（Gemini 用 camelCase）。
+        let mut gen = serde_json::Map::new();
+        if let Some(t) = self.params.temperature {
+            gen.insert("temperature".to_string(), json!(t));
+        }
+        if let Some(p) = self.params.top_p {
+            gen.insert("topP".to_string(), json!(p));
+        }
+        if let Some(m) = self.params.max_tokens {
+            gen.insert("maxOutputTokens".to_string(), json!(m));
+        }
+        if let Some(f) = self.params.frequency_penalty {
+            gen.insert("frequencyPenalty".to_string(), json!(f));
+        }
+        if let Some(pp) = self.params.presence_penalty {
+            gen.insert("presencePenalty".to_string(), json!(pp));
+        }
+        if !gen.is_empty() {
+            body["generationConfig"] = Value::Object(gen);
+        }
         body
     }
 
@@ -198,8 +222,8 @@ impl super::ProviderClient for GeminiClient {
             .http
             .post(&url)
             .header("content-type", "application/json")
-            .json(&body)
-            .send()
+            .json(&body);
+        let resp = super::send_with_retry(resp, self.max_retries)
             .await
             .map_err(|e| {
                 raven_types::AgentError::network(
@@ -262,8 +286,8 @@ impl super::ProviderClient for GeminiClient {
             .http
             .post(&url)
             .header("content-type", "application/json")
-            .json(&body)
-            .send()
+            .json(&body);
+        let resp = super::send_with_retry(resp, self.max_retries)
             .await
             .map_err(|e| {
                 raven_types::AgentError::network(format!("请求失败: {}", e), "检查网络连接")

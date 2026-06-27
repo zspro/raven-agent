@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use raven_types::{
-    ChatResponse, Message, ModelInfo, ProviderConfig, StreamEvent, TokenUsage, ToolCall,
-    ToolCallFunction, ToolSchema,
+    ApiConfig, ChatResponse, Message, ModelConfig, ModelInfo, ProviderConfig, StreamEvent,
+    TokenUsage, ToolCall, ToolCallFunction, ToolSchema,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -15,17 +15,43 @@ use tracing::{debug, error, trace};
 /// OpenAI 兼容 API 客户端
 pub struct OpenAICompatibleClient {
     config: ProviderConfig,
+    params: ModelConfig,
+    max_retries: u32,
     http: reqwest::Client,
 }
 
 impl OpenAICompatibleClient {
-    pub fn new(config: ProviderConfig) -> Self {
+    pub fn new(config: ProviderConfig, params: ModelConfig, api: ApiConfig) -> Self {
         Self {
             config,
+            params,
+            max_retries: api.max_retries,
             http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
+                .timeout(std::time::Duration::from_secs(api.timeout))
                 .build()
                 .unwrap(),
+        }
+    }
+
+    /// 构造请求体：未显式配置 temperature 时回退到 0.7（保持既有默认行为），
+    /// 其余参数仅在配置存在时才下发（让提供商用自身默认）。
+    fn build_body(
+        &self,
+        model: &str,
+        messages: &[Message],
+        tools: Option<&[ToolSchema]>,
+        stream: bool,
+    ) -> ChatRequestBody {
+        ChatRequestBody {
+            model: model.to_string(),
+            messages: messages.to_vec(),
+            stream,
+            tools: tools.map(|t| t.to_vec()),
+            temperature: Some(self.params.temperature.unwrap_or(0.7)),
+            max_tokens: self.params.max_tokens,
+            top_p: self.params.top_p,
+            frequency_penalty: self.params.frequency_penalty,
+            presence_penalty: self.params.presence_penalty,
         }
     }
 }
@@ -42,13 +68,7 @@ impl super::ProviderClient for OpenAICompatibleClient {
         messages: &[Message],
         tools: Option<&[ToolSchema]>,
     ) -> Result<ChatResponse, raven_types::AgentError> {
-        let body = ChatRequestBody {
-            model: model.to_string(),
-            messages: messages.to_vec(),
-            stream: false,
-            tools: tools.map(|t| t.to_vec()),
-            temperature: Some(0.7),
-        };
+        let body = self.build_body(model, messages, tools, false);
 
         debug!("发送请求到 {}, model={}", self.config.base_url, model);
 
@@ -60,8 +80,8 @@ impl super::ProviderClient for OpenAICompatibleClient {
                 format!("Bearer {}", self.config.api_key.as_deref().unwrap_or("")),
             )
             .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
+            .json(&body);
+        let resp = super::send_with_retry(resp, self.max_retries)
             .await
             .map_err(|e| {
                 raven_types::AgentError::network(
@@ -117,13 +137,7 @@ impl super::ProviderClient for OpenAICompatibleClient {
         messages: &[Message],
         tools: Option<&[ToolSchema]>,
     ) -> Result<mpsc::Receiver<StreamEvent>, raven_types::AgentError> {
-        let body = ChatRequestBody {
-            model: model.to_string(),
-            messages: messages.to_vec(),
-            stream: true,
-            tools: tools.map(|t| t.to_vec()),
-            temperature: Some(0.7),
-        };
+        let body = self.build_body(model, messages, tools, true);
 
         let resp = self
             .http
@@ -133,8 +147,8 @@ impl super::ProviderClient for OpenAICompatibleClient {
                 format!("Bearer {}", self.config.api_key.as_deref().unwrap_or("")),
             )
             .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
+            .json(&body);
+        let resp = super::send_with_retry(resp, self.max_retries)
             .await
             .map_err(|e| {
                 raven_types::AgentError::network(format!("请求失败: {}", e), "检查网络连接")
@@ -330,6 +344,14 @@ struct ChatRequestBody {
     tools: Option<Vec<ToolSchema>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frequency_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    presence_penalty: Option<f32>,
 }
 
 #[derive(Debug, Deserialize)]

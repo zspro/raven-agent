@@ -148,6 +148,56 @@ impl ConfigSystem {
             other.server,
             present.get("server").and_then(|v| v.as_table()),
         );
+        self.merge_model_params(other.model_params);
+        if present.contains_key("tui") {
+            self.merge_tui(other.tui, present.get("tui").and_then(|v| v.as_table()));
+        }
+        if present.contains_key("api") {
+            self.merge_api(other.api, present.get("api").and_then(|v| v.as_table()));
+        }
+    }
+
+    /// 合并 `[model_params]`。各字段都是 Option，新层有值即覆盖。
+    fn merge_model_params(&mut self, other: raven_types::ModelConfig) {
+        if other.temperature.is_some() {
+            self.config.model_params.temperature = other.temperature;
+        }
+        if other.max_tokens.is_some() {
+            self.config.model_params.max_tokens = other.max_tokens;
+        }
+        if other.top_p.is_some() {
+            self.config.model_params.top_p = other.top_p;
+        }
+        if other.frequency_penalty.is_some() {
+            self.config.model_params.frequency_penalty = other.frequency_penalty;
+        }
+        if other.presence_penalty.is_some() {
+            self.config.model_params.presence_penalty = other.presence_penalty;
+        }
+    }
+
+    /// 合并 `[tui]`。仅当文件中确实写出 `preview_lines` 键时才覆盖
+    /// （0 是合法值=不折叠，不能用「>0」判断）。
+    fn merge_tui(&mut self, other: raven_types::TuiConfig, present: Option<&toml::Table>) {
+        let has = |k: &str| present.map(|t| t.contains_key(k)).unwrap_or(false);
+        if has("preview_lines") {
+            self.config.tui.preview_lines = other.preview_lines;
+        }
+    }
+
+    /// 合并 `[api]`。仅当文件中确实写出对应键时才覆盖
+    /// （stream 的 false、max_retries 的 0 都是合法值，不能用「非零/为真」判断）。
+    fn merge_api(&mut self, other: raven_types::ApiConfig, present: Option<&toml::Table>) {
+        let has = |k: &str| present.map(|t| t.contains_key(k)).unwrap_or(false);
+        if has("timeout") {
+            self.config.api.timeout = other.timeout;
+        }
+        if has("max_retries") {
+            self.config.api.max_retries = other.max_retries;
+        }
+        if has("stream") {
+            self.config.api.stream = other.stream;
+        }
     }
 
     fn merge_permission(&mut self, other: raven_types::PermissionConfig) {

@@ -12,8 +12,8 @@ use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use raven_types::{
-    ChatResponse, Message, ModelInfo, ProviderConfig, Role, StreamEvent, TokenUsage, ToolCall,
-    ToolCallFunction, ToolSchema,
+    ApiConfig, ChatResponse, Message, ModelConfig, ModelInfo, ProviderConfig, Role, StreamEvent,
+    TokenUsage, ToolCall, ToolCallFunction, ToolSchema,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -25,15 +25,19 @@ const DEFAULT_MAX_TOKENS: u32 = 8192;
 
 pub struct AnthropicClient {
     config: ProviderConfig,
+    params: ModelConfig,
+    max_retries: u32,
     http: reqwest::Client,
 }
 
 impl AnthropicClient {
-    pub fn new(config: ProviderConfig) -> Self {
+    pub fn new(config: ProviderConfig, params: ModelConfig, api: ApiConfig) -> Self {
         Self {
             config,
+            params,
+            max_retries: api.max_retries,
             http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
+                .timeout(std::time::Duration::from_secs(api.timeout))
                 .build()
                 .unwrap(),
         }
@@ -142,10 +146,16 @@ impl AnthropicClient {
         let (system, msgs) = Self::convert_messages(messages);
         let mut body = json!({
             "model": model,
-            "max_tokens": DEFAULT_MAX_TOKENS,
+            "max_tokens": self.params.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
             "messages": msgs,
             "stream": stream,
         });
+        if let Some(t) = self.params.temperature {
+            body["temperature"] = json!(t);
+        }
+        if let Some(p) = self.params.top_p {
+            body["top_p"] = json!(p);
+        }
         if let Some(sys) = system {
             body["system"] = json!(sys);
         }
@@ -179,8 +189,8 @@ impl super::ProviderClient for AnthropicClient {
             .header("x-api-key", self.config.api_key.as_deref().unwrap_or(""))
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
-            .json(&body)
-            .send()
+            .json(&body);
+        let resp = super::send_with_retry(resp, self.max_retries)
             .await
             .map_err(|e| {
                 raven_types::AgentError::network(
@@ -249,8 +259,8 @@ impl super::ProviderClient for AnthropicClient {
             .header("x-api-key", self.config.api_key.as_deref().unwrap_or(""))
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
-            .json(&body)
-            .send()
+            .json(&body);
+        let resp = super::send_with_retry(resp, self.max_retries)
             .await
             .map_err(|e| {
                 raven_types::AgentError::network(format!("请求失败: {}", e), "检查网络连接")

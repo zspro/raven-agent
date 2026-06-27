@@ -5,8 +5,8 @@
 
 use async_trait::async_trait;
 use raven_types::{
-    ChatResponse, Message, ModelInfo, ProviderConfig, ProviderFeatures, ProviderVerification,
-    StreamEvent, ToolSchema,
+    ApiConfig, ChatResponse, Message, ModelConfig, ModelInfo, ProviderConfig, ProviderFeatures,
+    ProviderVerification, StreamEvent, ToolSchema,
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -79,11 +79,45 @@ impl ProviderKind {
 }
 
 /// 按 provider 配置创建对应协议的客户端
-fn make_client(config: ProviderConfig) -> Box<dyn ProviderClient> {
+fn make_client(
+    config: ProviderConfig,
+    params: ModelConfig,
+    api: ApiConfig,
+) -> Box<dyn ProviderClient> {
     match ProviderKind::detect(&config.name, &config.base_url) {
-        ProviderKind::Anthropic => Box::new(AnthropicClient::new(config)),
-        ProviderKind::Gemini => Box::new(GeminiClient::new(config)),
-        ProviderKind::OpenAI => Box::new(OpenAICompatibleClient::new(config)),
+        ProviderKind::Anthropic => Box::new(AnthropicClient::new(config, params, api)),
+        ProviderKind::Gemini => Box::new(GeminiClient::new(config, params, api)),
+        ProviderKind::OpenAI => Box::new(OpenAICompatibleClient::new(config, params, api)),
+    }
+}
+
+/// 带指数退避的请求发送：仅对网络超时/连接错误、429、5xx 重试，4xx 不重试。
+///
+/// 用 `try_clone()` 复制 builder 以便重试（json body 可克隆；遇到不可克隆的
+/// body 则退化为单次发送）。退避序列 500ms / 1s / 2s …（`500ms * 2^attempt`）。
+pub(crate) async fn send_with_retry(
+    builder: reqwest::RequestBuilder,
+    max_retries: u32,
+) -> reqwest::Result<reqwest::Response> {
+    let mut attempt = 0u32;
+    loop {
+        let resp = match builder.try_clone() {
+            Some(b) => b.send().await,
+            None => return builder.send().await,
+        };
+        let retriable = match &resp {
+            Ok(r) => {
+                let s = r.status();
+                s.as_u16() == 429 || s.is_server_error()
+            }
+            Err(e) => e.is_timeout() || e.is_connect(),
+        };
+        if !retriable || attempt >= max_retries {
+            return resp;
+        }
+        let backoff = Duration::from_millis(500u64 * 2u64.pow(attempt));
+        tokio::time::sleep(backoff).await;
+        attempt += 1;
     }
 }
 
@@ -94,6 +128,10 @@ fn make_client(config: ProviderConfig) -> Box<dyn ProviderClient> {
 /// 模型路由器
 pub struct Router {
     providers: Arc<RwLock<Vec<ProviderEntry>>>,
+    /// 全局模型推理参数（temperature/max_tokens/top_p/惩罚项），注入到每个客户端。
+    params: Arc<RwLock<ModelConfig>>,
+    /// 全局 API 调用层设置（超时 / 重试 / 流式开关），注入到每个客户端。
+    api: Arc<RwLock<ApiConfig>>,
 }
 
 struct ProviderEntry {
@@ -132,7 +170,20 @@ impl Router {
     pub fn new() -> Self {
         Self {
             providers: Arc::new(RwLock::new(Vec::new())),
+            params: Arc::new(RwLock::new(ModelConfig::default())),
+            api: Arc::new(RwLock::new(ApiConfig::default())),
         }
+    }
+
+    /// 设置全局模型推理参数（注册提供商前调用；已注册的客户端在下次 `resolve` 时重建生效）。
+    pub async fn set_model_params(&self, params: ModelConfig) {
+        *self.params.write().await = params;
+    }
+
+    /// 设置全局 API 调用层设置（超时 / 重试 / 流式开关）。同 `set_model_params`，
+    /// 在下次 `resolve` 重建客户端时生效。
+    pub async fn set_api_config(&self, api: ApiConfig) {
+        *self.api.write().await = api;
     }
 
     /// 注册提供商
@@ -146,7 +197,11 @@ impl Router {
 
         let client_config = ProviderConfig { base_url, ..config };
 
-        let client = make_client(client_config.clone());
+        let client = make_client(
+            client_config.clone(),
+            self.params.read().await.clone(),
+            self.api.read().await.clone(),
+        );
 
         info!("已注册提供商: {} ({:?})", name, kind);
 
@@ -274,6 +329,8 @@ impl Router {
         model_id: &str,
     ) -> Result<(Box<dyn ProviderClient>, String), raven_types::AgentError> {
         let providers = self.providers.read().await;
+        let params = self.params.read().await.clone();
+        let api = self.api.read().await.clone();
 
         if providers.is_empty() {
             return Err(raven_types::AgentError::config(
@@ -304,19 +361,28 @@ impl Router {
                     )
                 })?;
 
-            return Ok((make_client(entry.config.clone()), model_name.to_string()));
+            return Ok((
+                make_client(entry.config.clone(), params.clone(), api.clone()),
+                model_name.to_string(),
+            ));
         }
 
         // 只指定了模型名，使用第一个匹配的提供商
         for entry in providers.iter() {
             if entry.config.models.contains(&model_id.to_string()) {
-                return Ok((make_client(entry.config.clone()), model_id.to_string()));
+                return Ok((
+                    make_client(entry.config.clone(), params.clone(), api.clone()),
+                    model_id.to_string(),
+                ));
             }
         }
 
         // 使用默认提供商
         let default = &providers[0];
-        Ok((make_client(default.config.clone()), model_id.to_string()))
+        Ok((
+            make_client(default.config.clone(), params, api),
+            model_id.to_string(),
+        ))
     }
 
     /// 验证单个提供商

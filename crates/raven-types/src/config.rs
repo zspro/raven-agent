@@ -30,6 +30,16 @@ pub struct Config {
     pub git_first: GitFirstConfig,
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
+    /// 模型推理参数（temperature/max_tokens/top_p/惩罚项）。
+    /// 顶层已有 `model` 键，故配置段命名为 `[model_params]` 而非 `[model]`。
+    #[serde(default)]
+    pub model_params: ModelConfig,
+    /// TUI 相关设置（如工具输出折叠行数）。
+    #[serde(default)]
+    pub tui: TuiConfig,
+    /// API 调用层设置（请求超时 / 失败重试 / 流式开关）。
+    #[serde(default)]
+    pub api: ApiConfig,
 }
 
 impl Default for Config {
@@ -47,6 +57,9 @@ impl Default for Config {
             server: ServerConfig::default(),
             git_first: GitFirstConfig::default(),
             mcp_servers: Vec::new(),
+            model_params: ModelConfig::default(),
+            tui: TuiConfig::default(),
+            api: ApiConfig::default(),
         }
     }
 }
@@ -129,6 +142,80 @@ fn default_keep_rounds() -> usize {
     6
 }
 
+/// 模型推理参数。全部 `Option`：未设置时由各提供商客户端使用自身默认，
+/// 避免把一个写死的默认值强加到所有协议上。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelConfig {
+    /// 采样温度（0~2），越高越随机。OpenAI/Anthropic/Gemini 通用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    /// 单次回复最大生成 token 数。Anthropic 必填（缺省回退内置常量），OpenAI/Gemini 可选。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    /// 核采样阈值 top_p（0~1）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    /// 频率惩罚（-2~2，OpenAI 兼容）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    /// 存在惩罚（-2~2，OpenAI 兼容）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+}
+
+/// TUI 行为设置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TuiConfig {
+    /// 工具输出折叠后保留的预览行数（0 = 不折叠，完整显示）。
+    #[serde(default = "default_preview_lines")]
+    pub preview_lines: usize,
+}
+
+impl Default for TuiConfig {
+    fn default() -> Self {
+        Self {
+            preview_lines: default_preview_lines(),
+        }
+    }
+}
+
+fn default_preview_lines() -> usize {
+    5
+}
+
+/// API 调用层设置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiConfig {
+    /// 单次 HTTP 请求超时（秒）。
+    #[serde(default = "default_api_timeout")]
+    pub timeout: u64,
+    /// 失败重试次数（指数退避）。仅对网络错误 / 429 / 5xx 重试，4xx 不重试。
+    /// 0 = 不重试。
+    #[serde(default = "default_api_max_retries")]
+    pub max_retries: u32,
+    /// 是否默认走 SSE 流式输出。某些第三方端点不支持流式，可关掉退化为整段返回。
+    #[serde(default = "default_true")]
+    pub stream: bool,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            timeout: default_api_timeout(),
+            max_retries: default_api_max_retries(),
+            stream: true,
+        }
+    }
+}
+
+fn default_api_timeout() -> u64 {
+    120
+}
+
+fn default_api_max_retries() -> u32 {
+    2
+}
+
 /// 工具配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolsConfig {
@@ -136,6 +223,9 @@ pub struct ToolsConfig {
     pub enabled: Vec<String>,
     #[serde(default)]
     pub shell: ShellConfig,
+    /// 子 agent 并行上限（task 工具一批最多同时跑几个子 agent）
+    #[serde(default = "default_max_parallel_agents")]
+    pub max_parallel_agents: usize,
 }
 
 impl Default for ToolsConfig {
@@ -143,8 +233,13 @@ impl Default for ToolsConfig {
         Self {
             enabled: default_enabled_tools(),
             shell: ShellConfig::default(),
+            max_parallel_agents: default_max_parallel_agents(),
         }
     }
+}
+
+fn default_max_parallel_agents() -> usize {
+    4
 }
 
 fn default_enabled_tools() -> Vec<String> {

@@ -10,72 +10,32 @@
 //! - 信息栏：每轮结束打印模型 / token / 权限模式。
 //! - 循环：同步 REPL（rustyline.readline）+ 本地 tokio runtime 做 async
 //!
+//! 模块划分：theme（颜色/spinner/围栏标记）、latex（数学预处理）、render（Markdown→ANSI）、
+//! helper（rustyline Helper）、stream（流式延迟提交）、tool_display（工具事件美化）。
+//!
 //! 启动: raven tui
 
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+mod helper;
+mod latex;
+mod latex_unicode;
+mod render;
+mod stream;
+mod theme;
+mod tool_display;
+mod width;
+
+use helper::{ExpandHandler, ReplHelper};
 use raven_core::Agent;
-use rustyline::completion::{Completer, Pair};
+use render::Renderer;
 use rustyline::error::ReadlineError;
-use rustyline::highlight::{CmdKind, Highlighter, MatchingBracketHighlighter};
-use rustyline::hint::{Hinter, HistoryHinter};
 use rustyline::history::DefaultHistory;
-use rustyline::validate::{MatchingBracketValidator, ValidationResult, Validator};
-use rustyline::{CompletionType, Config, Context, EditMode, Editor, Helper};
-use std::borrow::Cow;
+use rustyline::{Config, EditMode, Editor, Event, EventHandler, KeyEvent};
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use syntect::easy::HighlightLines;
-use syntect::highlighting::ThemeSet;
-use syntect::parsing::SyntaxSet;
-
-// =============================================================================
-// 颜色主题 — 集中管理所有 ANSI 颜色，一处修改全局生效
-// =============================================================================
-
-struct ColorTheme;
-
-impl ColorTheme {
-    const DIM: &'static str = "\x1b[90m";
-    const RESET: &'static str = "\x1b[0m";
-    const BOLD: &'static str = "\x1b[1m";
-    const ITALIC: &'static str = "\x1b[3m";
-    const UNDERLINE: &'static str = "\x1b[4m";
-    const ACCENT: &'static str = "\x1b[36m"; // 青色：工具调用、引用、标题
-    const ERROR: &'static str = "\x1b[31m"; // 红色：错误
-    const SUCCESS: &'static str = "\x1b[32m"; // 绿色：成功
-    const CODE_INLINE: &'static str = "\x1b[33m"; // 黄色：行内代码
-    const BULLET: &'static str = "\x1b[33m"; // 黄色：列表符号
-    const HEADING_H1: &'static str = "\x1b[1;36m";
-    const HEADING_H2: &'static str = "\x1b[1;34m";
-    const HEADING_H3: &'static str = "\x1b[1;35m";
-    const QUOTE: &'static str = "\x1b[36m";
-    const STRIKETHROUGH: &'static str = "\x1b[9m";
-    const CODE_BG: &'static str = "\x1b[48;5;236m"; // 代码块深色背景
-    const LINK: &'static str = "\x1b[34m"; // 蓝色：链接
-}
-
-// =============================================================================
-// Spinner — braille 旋转动画帧
-// =============================================================================
-
-const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-/// 根据索引返回 spinner 帧字符
-fn spinner_frame(idx: u32) -> &'static str {
-    SPINNER_FRAMES[(idx as usize) % SPINNER_FRAMES.len()]
-}
-
-// =============================================================================
-// 围栏标记 — 用于流式渲染中追踪未闭合代码围栏
-// =============================================================================
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FenceMarker {
-    /// 围栏字符：'`' (backtick) 或 '~' (tilde)
-    character: char,
-    /// 围栏长度（最少 3）
-    length: usize,
-}
+use stream::MarkdownStreamState;
+use theme::ColorTheme;
+use tool_display::{parse_tool_call, parse_tool_result, render_result_only, render_tool_header};
 
 // =============================================================================
 // 入口
@@ -102,32 +62,56 @@ pub fn run(agent: Arc<Agent>, opening: String) -> anyhow::Result<()> {
 // Repl — 核心结构，持有所有状态
 // =============================================================================
 
+/// 一轮里展示过的工具调用，供 Ctrl+O 展开时按原序重打完整输出。
+struct ToolRecord {
+    name: String,
+    args: String,
+    output: String,
+    is_error: bool,
+}
+
 struct Repl {
     agent: Arc<Agent>,
     rt: tokio::runtime::Runtime,
     editor: Editor<ReplHelper, DefaultHistory>,
     renderer: Renderer,
+    /// 工具输出折叠后保留的预览行数（`/preview <n>` 可改，0 表示不折叠）。
+    preview_lines: usize,
+    /// 上一轮的工具调用记录，Ctrl+O 时重打其完整输出。
+    last_tools: Vec<ToolRecord>,
+    /// Ctrl+O 按下标志：处理器置位，readline 返回后主循环检测并清零。
+    expand_flag: Arc<AtomicBool>,
 }
 
 impl Repl {
     fn new(agent: Arc<Agent>, rt: tokio::runtime::Runtime) -> Self {
-        let config = Config::builder()
-            .completion_type(CompletionType::List)
-            .edit_mode(EditMode::Emacs)
-            .build();
+        let config = Config::builder().edit_mode(EditMode::Emacs).build();
 
         let mut editor = Editor::with_config(config).expect("初始化 rustyline 失败");
         editor.set_helper(Some(ReplHelper::new()));
 
+        // Ctrl+O：展开上一轮被折叠的工具输出。处理器与主循环共享标志位。
+        let expand_flag = Arc::new(AtomicBool::new(false));
+        editor.bind_sequence(
+            Event::KeySeq(vec![KeyEvent::ctrl('o')]),
+            EventHandler::Conditional(Box::new(ExpandHandler::new(expand_flag.clone()))),
+        );
+
         // 加载历史
         let history_path = Self::history_path();
         let _ = editor.load_history(&history_path);
+
+        // 折叠行数从持久化配置读取（/preview 修改后会写回并热重载）。
+        let preview_lines = agent.config().tui.preview_lines;
 
         Self {
             agent,
             rt,
             editor,
             renderer: Renderer::new(),
+            preview_lines,
+            last_tools: Vec::new(),
+            expand_flag,
         }
     }
 
@@ -157,6 +141,12 @@ impl Repl {
                     break;
                 }
             };
+
+            // Ctrl+O：展开上一轮折叠的工具输出（处理器提交空行 + 置位标志）。
+            if self.expand_flag.swap(false, Ordering::Relaxed) {
+                self.expand_last_tools();
+                continue;
+            }
 
             let input = line.trim().to_string();
             if input.is_empty() {
@@ -195,9 +185,20 @@ impl Repl {
 
         let mut rx = rx;
         let mut stream = MarkdownStreamState::new();
+        // 待配对的工具调用 (name, args)，FIFO：core 按调用顺序发回 tool_result
+        let mut pending_calls: std::collections::VecDeque<(String, String)> =
+            std::collections::VecDeque::new();
         let mut tool_count = 0u32;
         let mut had_text = false;
         let mut interrupted = false;
+        // 本轮工具记录清零，逐个收集供 Ctrl+O 展开
+        self.last_tools.clear();
+        // 预览行数：0 表示不折叠（传 None）
+        let preview = if self.preview_lines == 0 {
+            None
+        } else {
+            Some(self.preview_lines)
+        };
 
         loop {
             // 在生成期间，Ctrl+C 只中断当前轮（不退出 REPL）
@@ -230,20 +231,37 @@ impl Repl {
                     }
                 }
                 "tool_call" => {
-                    // 工具调用前先 flush 已缓冲的文本
+                    // 工具调用前先 flush 已缓冲的文本，再立即打印「● 工具」标题行，
+                    // 让用户瞬间看到工具已启动（尤其并行 task 执行期间不再长时间空白）。
                     let rest = stream.flush(&self.renderer);
                     if !rest.is_empty() {
                         print!("{rest}");
                     }
                     let (name, args) = parse_tool_call(event.content.as_deref());
-                    print!("{}", render_tool_call(&name, &args, tool_count));
+                    print!("{}", render_tool_header(&name, &args));
                     let _ = std::io::stdout().flush();
+                    pending_calls.push_back((name, args));
                     tool_count += 1;
                 }
                 "tool_result" => {
                     let (name, output, is_error) = parse_tool_result(event.content.as_deref());
-                    print!("{}", render_tool_result(&name, &output, is_error));
+                    // 标题行已在 tool_call 时打印，这里只补结果体（按 preview 行数折叠）。
+                    // 配对队首调用以记录其 name/args，供 Ctrl+O 展开重打完整输出。
+                    let (call_name, args) = pending_calls
+                        .pop_front()
+                        .unwrap_or_else(|| (name.clone(), String::new()));
+                    print!("{}", render_result_only(&output, is_error, preview));
                     let _ = std::io::stdout().flush();
+                    self.last_tools.push(ToolRecord {
+                        name: if call_name.is_empty() {
+                            name
+                        } else {
+                            call_name
+                        },
+                        args,
+                        output,
+                        is_error,
+                    });
                 }
                 "error" => {
                     let rest = stream.flush(&self.renderer);
@@ -262,6 +280,9 @@ impl Repl {
                 _ => {}
             }
         }
+
+        // 收尾：中断时可能有未配对的工具调用（已发 call 未收 result），丢弃即可
+        pending_calls.clear();
 
         // flush 缓冲区剩余内容
         let rest = stream.flush(&self.renderer);
@@ -290,6 +311,25 @@ impl Repl {
         self.print_info_bar();
     }
 
+    /// Ctrl+O：把上一轮所有工具的**完整输出**重新打印到下方（不折叠）。
+    ///
+    /// 受行式 REPL 所限无法原地展开已滚走的内容，故重打整组。
+    fn expand_last_tools(&self) {
+        if self.last_tools.is_empty() {
+            println!(
+                "{dim}  (无可展开的工具输出){rst}\n",
+                dim = ColorTheme::DIM,
+                rst = ColorTheme::RESET
+            );
+            return;
+        }
+        for t in &self.last_tools {
+            print!("{}", render_tool_header(&t.name, &t.args));
+            print!("{}", render_result_only(&t.output, t.is_error, None));
+        }
+        println!();
+    }
+
     /// 会话信息栏：模型 · 权限模式 · token 用量
     fn print_info_bar(&self) {
         let stats = self.rt.block_on(self.agent.stats());
@@ -306,1731 +346,205 @@ impl Repl {
         );
     }
 
-    /// 处理斜杠命令，返回 true 表示应退出
+    /// 处理斜杠命令，返回 true 表示应退出 REPL
     fn handle_command(&mut self, cmd: &str) -> bool {
-        let dim = ColorTheme::DIM;
-        let rst = ColorTheme::RESET;
-        let ok = ColorTheme::SUCCESS;
-        let err = ColorTheme::ERROR;
+        // 带参数的命令先单独处理
+        if let Some(arg) = cmd.strip_prefix("/preview") {
+            self.set_preview(arg.trim());
+            return false;
+        }
         match cmd {
-            "/quit" | "/exit" | "/q" => true,
+            "/quit" | "/exit" | "/q" => return true,
             "/clear" => {
                 self.rt.block_on(self.agent.clear());
-                println!("{ok}✓ 会话已清空{rst}\n");
-                false
+                println!(
+                    "{ok}已清空会话{rst}\n",
+                    ok = ColorTheme::SUCCESS,
+                    rst = ColorTheme::RESET
+                );
             }
-            "/compact" => {
-                match self.rt.block_on(self.agent.compact()) {
-                    Ok(_) => {
-                        let stats = self.rt.block_on(self.agent.stats());
-                        println!(
-                            "{ok}✓ 已压缩（{} in / {} out）{rst}\n",
-                            stats.total_input_tokens, stats.total_output_tokens
-                        );
-                    }
-                    Err(e) => println!("{err}✗ 压缩失败: {e}{rst}\n"),
+            "/compact" => match self.rt.block_on(self.agent.compact()) {
+                Ok(()) => {
+                    let stats = self.rt.block_on(self.agent.stats());
+                    println!(
+                        "{ok}已压缩上下文{rst} {dim}(ctx {ctx} tokens){rst}\n",
+                        ok = ColorTheme::SUCCESS,
+                        rst = ColorTheme::RESET,
+                        dim = ColorTheme::DIM,
+                        ctx = stats.current_context_tokens
+                    );
                 }
-                false
-            }
+                Err(e) => {
+                    println!(
+                        "{err}压缩失败: {e}{rst}\n",
+                        err = ColorTheme::ERROR,
+                        rst = ColorTheme::RESET
+                    );
+                }
+            },
             "/cost" => {
                 let stats = self.rt.block_on(self.agent.stats());
+                let total = stats.total_input_tokens + stats.total_output_tokens;
                 println!(
-                    "{dim}  in: {} | out: {} | total: {}{rst}\n",
-                    stats.total_input_tokens,
-                    stats.total_output_tokens,
-                    stats.total_input_tokens + stats.total_output_tokens
+                    "{dim}  ctx {ctx} · {inp}↑/{out}↓ ({total} tokens){rst}\n",
+                    dim = ColorTheme::DIM,
+                    rst = ColorTheme::RESET,
+                    ctx = stats.current_context_tokens,
+                    inp = stats.total_input_tokens,
+                    out = stats.total_output_tokens,
                 );
-                false
             }
             "/help" => {
-                println!("{dim}/quit 退出 · /clear 清空 · /compact 压缩 · /cost 统计 · 生成中 Ctrl+C 中断本轮{rst}\n");
-                false
+                println!(
+                    "{dim}  /clear      清空会话\n  \
+                     /compact    压缩上下文\n  \
+                     /cost       查看 token 用量\n  \
+                     /preview <n> 工具输出折叠行数（0=不折叠，当前 {pv}）\n  \
+                     /quit       退出 (Ctrl+D){rst}\n  \
+                     {dim}Ctrl+O 展开上一轮工具的完整输出{rst}\n",
+                    dim = ColorTheme::DIM,
+                    rst = ColorTheme::RESET,
+                    pv = self.preview_lines,
+                );
             }
-            _ => {
-                println!("{err}未知命令: {cmd}{rst}\n");
-                false
+            other => {
+                println!(
+                    "{err}未知命令: {other}{rst} {dim}(/help 查看命令){rst}\n",
+                    err = ColorTheme::ERROR,
+                    rst = ColorTheme::RESET,
+                    dim = ColorTheme::DIM
+                );
+            }
+        }
+        false
+    }
+
+    /// 设置工具输出折叠的预览行数（`/preview <n>`）。空参数则显示当前值。
+    fn set_preview(&mut self, arg: &str) {
+        if arg.is_empty() {
+            println!(
+                "{dim}  当前折叠行数: {pv}（/preview <n> 修改，0=不折叠）{rst}\n",
+                dim = ColorTheme::DIM,
+                rst = ColorTheme::RESET,
+                pv = self.preview_lines,
+            );
+            return;
+        }
+        match arg.parse::<usize>() {
+            Ok(n) => {
+                self.preview_lines = n;
+                self.persist_preview_lines(n);
+                let desc = if n == 0 {
+                    "不折叠，完整显示".to_string()
+                } else {
+                    format!("折叠为 {n} 行预览")
+                };
+                println!(
+                    "{ok}已设置工具输出{desc}{rst} {dim}(已持久化){rst}\n",
+                    ok = ColorTheme::SUCCESS,
+                    rst = ColorTheme::RESET,
+                    dim = ColorTheme::DIM,
+                );
+            }
+            Err(_) => {
+                println!(
+                    "{err}无效行数: {arg}{rst} {dim}(需要非负整数){rst}\n",
+                    err = ColorTheme::ERROR,
+                    rst = ColorTheme::RESET,
+                    dim = ColorTheme::DIM,
+                );
             }
         }
     }
 
+    /// 把折叠行数写入 `~/.raven/config.toml` 的 `[tui]` 段，使其跨重启保留。
+    ///
+    /// 本会话已直接更新 `self.preview_lines`，运行时无其他读取者，故只落盘、
+    /// 不触发 Agent 热重载（避免为改个行数而重新注册所有提供商）。
+    fn persist_preview_lines(&self, n: usize) {
+        let Some(path) = dirs::home_dir().map(|h| h.join(".raven").join("config.toml")) else {
+            return;
+        };
+        Self::write_tui_preview_lines(&path, n);
+    }
+
+    /// 在 config.toml 的 `[tui]` 段写入/替换 `preview_lines`（值不加引号）。
+    /// 复用 cli 的解析思路，但 tui 不依赖 cli，故在此内联一份精简实现。
+    fn write_tui_preview_lines(path: &std::path::Path, n: usize) {
+        let content = if path.exists() {
+            std::fs::read_to_string(path).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let new_line = format!("preview_lines = {n}");
+        let is_section = |l: &str| l.trim_start().starts_with('[');
+        let is_key = |l: &str| {
+            let t = l.trim_start();
+            t.starts_with("preview_lines =") || t.starts_with("preview_lines=")
+        };
+        let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+        let header = "[tui]";
+        let hidx = lines.iter().position(|l| l.trim() == header);
+        let updated = match hidx {
+            Some(h) => {
+                let mut end = lines.len();
+                for (i, l) in lines.iter().enumerate().skip(h + 1) {
+                    if is_section(l) {
+                        end = i;
+                        break;
+                    }
+                }
+                match (h + 1..end).find(|&i| is_key(&lines[i])) {
+                    Some(i) => lines[i] = new_line,
+                    None => {
+                        let mut at = end;
+                        while at > h + 1 && lines[at - 1].trim().is_empty() {
+                            at -= 1;
+                        }
+                        lines.insert(at, new_line);
+                    }
+                }
+                lines.join("\n") + "\n"
+            }
+            None => format!("{}\n{}\n{}\n", content.trim_end(), header, new_line),
+        };
+        let _ = std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new(".")));
+        let _ = std::fs::write(path, updated);
+    }
+
     fn history_path() -> std::path::PathBuf {
         dirs::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .unwrap_or_else(|| ".".into())
             .join(".raven")
             .join("tui_history")
     }
 
     fn print_welcome(&self) {
-        let cfg = self.agent.config();
-        let bold = ColorTheme::BOLD;
+        let art = [
+            r"       ___      ",
+            r"      (o,o)     ",
+            r#"      {  "  }    "#,
+            r#"    ---"-"---   "#,
+        ];
+        let tag = ["", "Raven 🐦‍⬛", "Think like a raven.", "Code like the wind."];
         let accent = ColorTheme::ACCENT;
         let dim = ColorTheme::DIM;
         let rst = ColorTheme::RESET;
-
-        // 乌鸦 ASCII 标志 —— Think like a raven. Code like the wind.
-        let art = [
-            "      ___",
-            "     (o,o)    ",
-            "    {  \"  }   ",
-            "  ---\"-\"---   ",
-        ];
-        let tag = ["", "Raven 🐦‍⬛", "Think like a raven.", "Code like the wind."];
-        println!();
-        for (a, t) in art.iter().zip(tag.iter()) {
-            if t.is_empty() {
-                println!("  {accent}{a}{rst}");
-            } else if t.starts_with("Raven") {
-                println!("  {accent}{a}{rst}  {bold}{accent}{t}{rst}");
-            } else {
-                println!("  {accent}{a}{rst}  {dim}{t}{rst}");
-            }
+        for (i, line) in art.iter().enumerate() {
+            let t = tag.get(i).copied().unwrap_or("");
+            println!("{accent}{line}{rst}  {dim}{t}{rst}");
         }
-        println!();
         println!(
-            "  {dim}模型{rst} {model}   {dim}模式{rst} {mode}",
-            model = cfg.model,
+            "\n{dim}  {model} · {mode}{rst}",
+            dim = dim,
+            rst = rst,
+            model = self.agent.config().model,
             mode = self.agent.permission_mode(),
         );
-        println!("  {dim}/help 查看命令 · Ctrl+C 中断生成 · Ctrl+D 退出{rst}\n");
-    }
-}
-
-// =============================================================================
-// Markdown → ANSI 渲染
-// =============================================================================
-
-/// 预处理：HTML `<sub>`/`<sup>` + LaTeX `$...$`/`$$...$$` 数学 → Unicode 上下标
-///
-/// 化学方程式示例：
-///   H<sub>2</sub>O            → H₂O
-///   $2H_2 + O_2 \rightarrow 2H_2O$ → 2H₂ + O₂ → 2H₂O
-fn preprocess_chemistry(text: &str) -> String {
-    // 第一步：HTML 标签
-    let text = preprocess_html_sub_sup(text);
-    // 第二步：LaTeX 数学（$...$ 内部）
-    let text = preprocess_latex_math(&text);
-    // 第三步：独立 \command（$...$ 外面的 \boxed{...}, \quad, \; 等）
-    preprocess_standalone_commands(&text)
-}
-
-/// 处理 $...$ 外部的独立 LaTeX 命令（\boxed, \quad, \; 等）
-fn preprocess_standalone_commands(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let chars: Vec<char> = text.chars().collect();
-    let mut i = 0;
-
-    while i < chars.len() {
-        if chars[i] == '\\' && i + 1 < chars.len() {
-            let next = chars[i + 1];
-            // 空格类: \  \quad \qquad \; \, \: \!
-            if next == ' ' || matches!(next, ';' | ',' | ':' | '!') {
-                out.push(' ');
-                i += 2;
-                continue;
-            }
-            if next.is_alphabetic() {
-                let cmd_start = i + 1;
-                let mut j = cmd_start;
-                while j < chars.len() && chars[j].is_alphabetic() {
-                    j += 1;
-                }
-                let cmd: String = chars[cmd_start..j].iter().collect();
-
-                match cmd.as_str() {
-                    // 空格类
-                    "quad" | "qquad" => {
-                        out.push(' ');
-                        i = j;
-                        continue;
-                    }
-                    // 无操作（忽略）
-                    "displaystyle" | "textstyle" | "scriptstyle" => {
-                        i = j;
-                        continue;
-                    }
-                    // \boxed{...} → 提取内容
-                    "boxed" => {
-                        if j < chars.len() && chars[j] == '{' {
-                            let mut depth = 1u32;
-                            let mut k = j + 1;
-                            while k < chars.len() && depth > 0 {
-                                if chars[k] == '{' {
-                                    depth += 1;
-                                }
-                                if chars[k] == '}' {
-                                    depth -= 1;
-                                }
-                                if depth > 0 {
-                                    k += 1;
-                                }
-                            }
-                            let inner: String = chars[j + 1..k].iter().collect();
-                            // 递归处理内部内容
-                            let processed = preprocess_standalone_commands(&inner);
-                            out.push_str(&processed);
-                            i = k + 1; // skip }
-                            continue;
-                        }
-                        i = j;
-                        continue;
-                    }
-                    // 文本模式: \text{...}, \mathrm{...} → 提取内容
-                    "text" | "mathrm" | "mathbf" | "mathcal" | "mathit" | "mathsf" | "mathtt" => {
-                        if j < chars.len() && chars[j] == '{' {
-                            let mut depth = 1u32;
-                            let mut k = j + 1;
-                            while k < chars.len() && depth > 0 {
-                                if chars[k] == '{' {
-                                    depth += 1;
-                                }
-                                if chars[k] == '}' {
-                                    depth -= 1;
-                                }
-                                if depth > 0 {
-                                    k += 1;
-                                }
-                            }
-                            let inner: String = chars[j + 1..k].iter().collect();
-                            let processed = preprocess_standalone_commands(&inner);
-                            out.push_str(&processed);
-                            i = k + 1;
-                            continue;
-                        }
-                        i = j;
-                        continue;
-                    }
-                    _ => {
-                        // 未知命令，保留原样
-                        out.push('\\');
-                        out.push_str(&cmd);
-                        i = j;
-                        continue;
-                    }
-                }
-            }
-            // 非字母非空格的 \X → 原样保留
-            out.push(chars[i]);
-            i += 1;
-        } else {
-            out.push(chars[i]);
-            i += 1;
-        }
-    }
-    out
-}
-
-fn preprocess_html_sub_sup(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if i + 5 <= bytes.len() && &bytes[i..i + 5] == b"<sub>" {
-            i += 5;
-            let start = i;
-            while i + 6 <= bytes.len() && &bytes[i..i + 6] != b"</sub>" {
-                i += 1;
-            }
-            let content = std::str::from_utf8(&bytes[start..i]).unwrap_or("");
-            if all_subscriptable(content) {
-                out.push_str(&sub_to_unicode(content));
-            } else {
-                out.push_str(&format!("_({content})"));
-            }
-            if i + 6 <= bytes.len() {
-                i += 6;
-            }
-        } else if i + 5 <= bytes.len() && &bytes[i..i + 5] == b"<sup>" {
-            i += 5;
-            let start = i;
-            while i + 6 <= bytes.len() && &bytes[i..i + 6] != b"</sup>" {
-                i += 1;
-            }
-            let content = std::str::from_utf8(&bytes[start..i]).unwrap_or("");
-            if all_superscriptable(content) {
-                out.push_str(&sup_to_unicode(content));
-            } else {
-                out.push_str(&format!("^({content})"));
-            }
-            if i + 6 <= bytes.len() {
-                i += 6;
-            }
-        } else {
-            let ch = text[i..].chars().next().unwrap_or('\0');
-            out.push(ch);
-            i += ch.len_utf8();
-        }
-    }
-    out
-}
-
-/// 扫描 `$...$` / `$$...$$` / `\(...\)` / `\[...\]` 并转换 LaTeX 数学 → Unicode
-fn preprocess_latex_math(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let bytes = text.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-
-    while i < len {
-        // 检测 \[ 块 (LaTeX display math)
-        if i + 2 <= len && &bytes[i..i + 2] == b"\\[" {
-            let start = i + 2;
-            if let Some(end) = text[start..].find("\\]") {
-                let math = &text[start..start + end];
-                out.push_str(&latex_to_unicode(math));
-                i = start + end + 2;
-                continue;
-            }
-        }
-        // 检测 \( 行内 (LaTeX inline math)
-        if i + 2 <= len && &bytes[i..i + 2] == b"\\(" {
-            let start = i + 2;
-            if let Some(end) = text[start..].find("\\)") {
-                let math = &text[start..start + end];
-                out.push_str(&latex_to_unicode(math));
-                i = start + end + 2;
-                continue;
-            }
-        }
-        // 检测 $$ 块
-        if i + 2 <= len && &bytes[i..i + 2] == b"$$" {
-            // 跳过 `$$` 分隔符，找到匹配的 `$$`
-            let start = i + 2;
-            if let Some(end) = text[start..].find("$$") {
-                let math = &text[start..start + end];
-                out.push_str(&latex_to_unicode(math));
-                i = start + end + 2;
-                continue;
-            }
-        }
-        // 检测 $ 行内（反斜杠保护 \$ 不算）
-        if bytes[i] == b'$' && (i == 0 || bytes[i - 1] != b'\\') {
-            // 跳过 $, 找到匹配的 $
-            let start = i + 1;
-            if let Some(end) = text[start..].find('$') {
-                // 过滤货币: "$5" 或 "$10.50" — 数字紧跟 $ 不算数学
-                let math = &text[start..start + end];
-                if !math.is_empty() && !math.starts_with(|c: char| c.is_ascii_digit()) {
-                    out.push_str(&latex_to_unicode(math));
-                    i = start + end + 1;
-                    continue;
-                }
-            }
-        }
-        let ch = text[i..].chars().next().unwrap_or('\0');
-        out.push(ch);
-        i += ch.len_utf8();
-    }
-    out
-}
-
-/// 精简版 LaTeX → Unicode（对齐 oh-my-pi 的 latex-to-unicode.ts）
-fn latex_to_unicode(math: &str) -> String {
-    let mut out = String::with_capacity(math.len());
-    let chars: Vec<char> = math.chars().collect();
-    let mut i = 0;
-
-    while i < chars.len() {
-        let c = chars[i];
-        match c {
-            // 下标: _ 后跟单字符 或 _{...}（不可映射时 fallback _(...)）
-            '_' => {
-                i += 1;
-                if i < chars.len() && chars[i] == '{' {
-                    i += 1;
-                    let content = extract_brace_group(&chars, &mut i);
-                    let inner = latex_to_unicode(&content);
-                    if all_subscriptable(&inner) {
-                        out.push_str(&sub_to_unicode(&inner));
-                    } else {
-                        out.push_str(&format!("_({inner})"));
-                    }
-                    i += 1;
-                } else if i < chars.len() {
-                    let ch = chars[i];
-                    let inner = latex_to_unicode(&ch.to_string());
-                    if all_subscriptable(&inner) {
-                        out.push_str(&sub_to_unicode(&inner));
-                    } else {
-                        out.push_str(&format!("_({inner})"));
-                    }
-                    i += 1;
-                }
-            }
-            // 上标: ^ 后跟单字符 或 ^{...}（不可映射时 fallback ^(...)）
-            '^' => {
-                i += 1;
-                if i < chars.len() && chars[i] == '{' {
-                    i += 1;
-                    let content = extract_brace_group(&chars, &mut i);
-                    let inner = latex_to_unicode(&content);
-                    if all_superscriptable(&inner) {
-                        out.push_str(&sup_to_unicode(&inner));
-                    } else {
-                        out.push_str(&format!("^({inner})"));
-                    }
-                    i += 1;
-                } else if i < chars.len() {
-                    let ch = chars[i];
-                    let inner = latex_to_unicode(&ch.to_string());
-                    if all_superscriptable(&inner) {
-                        out.push_str(&sup_to_unicode(&inner));
-                    } else {
-                        out.push_str(&format!("^({inner})"));
-                    }
-                    i += 1;
-                }
-            }
-            // 反斜杠命令
-            '\\' => {
-                i += 1;
-                let cmd_start = i;
-                while i < chars.len() && chars[i].is_alphabetic() {
-                    i += 1;
-                }
-                let cmd: String = chars[cmd_start..i].iter().collect();
-
-                // 空命令（\; \, \: \! \ 等）→ 空格
-                if cmd.is_empty() {
-                    out.push(' ');
-                    // 跳过空格类字符: 空格本身 \; \, \: \!  → 都已消费
-                    if i < chars.len() && matches!(chars[i], ';' | ',' | ':' | '!') {
-                        i += 1;
-                    }
-                    continue;
-                }
-
-                match cmd.as_str() {
-                    // 箭头
-                    "rightarrow" | "to" | "longrightarrow" => out.push('\u{2192}'),
-                    "leftarrow" | "longleftarrow" => out.push('\u{2190}'),
-                    "leftrightarrow" | "longleftrightarrow" => out.push('\u{2194}'),
-                    "Rightarrow" | "Longrightarrow" => out.push('\u{21D2}'),
-                    "Leftarrow" | "Longleftarrow" => out.push('\u{21D0}'),
-                    "uparrow" => out.push('\u{2191}'),
-                    "downarrow" => out.push('\u{2193}'),
-                    "rightleftharpoons" => out.push('\u{21CC}'),
-                    // 带文字箭头: \xrightarrow{text} → →(text)
-                    "xrightarrow" | "xleftarrow" | "xleftrightarrow" => {
-                        let arrow = match cmd.as_str() {
-                            "xrightarrow" => '\u{2192}',
-                            "xleftarrow" => '\u{2190}',
-                            _ => '\u{2194}',
-                        };
-                        if i < chars.len() && chars[i] == '{' {
-                            i += 1;
-                            let text = extract_brace_group(&chars, &mut i);
-                            out.push_str(&format!("\u{002D}{text}\u{2192}"));
-                            i += 1;
-                        } else {
-                            out.push(arrow);
-                        }
-                    }
-                    // 希腊字母
-                    "Delta" => out.push('\u{0394}'),
-                    "Gamma" => out.push('\u{0393}'),
-                    "alpha" => out.push('\u{03B1}'),
-                    "beta" => out.push('\u{03B2}'),
-                    "gamma" => out.push('\u{03B3}'),
-                    "delta" => out.push('\u{03B4}'),
-                    "epsilon" | "varepsilon" => out.push('\u{03B5}'),
-                    "zeta" => out.push('\u{03B6}'),
-                    "eta" => out.push('\u{03B7}'),
-                    "theta" => out.push('\u{03B8}'),
-                    "lambda" => out.push('\u{03BB}'),
-                    "mu" => out.push('\u{03BC}'),
-                    "nu" => out.push('\u{03BD}'),
-                    "xi" => out.push('\u{03BE}'),
-                    "pi" => out.push('\u{03C0}'),
-                    "rho" => out.push('\u{03C1}'),
-                    "sigma" => out.push('\u{03C3}'),
-                    "tau" => out.push('\u{03C4}'),
-                    "phi" | "varphi" => out.push('\u{03C6}'),
-                    "omega" => out.push('\u{03C9}'),
-                    // 运算符
-                    "times" => out.push('\u{00D7}'),
-                    "cdot" => out.push('\u{22C5}'),
-                    "pm" => out.push('\u{00B1}'),
-                    "mp" => out.push('\u{2213}'),
-                    "div" => out.push('\u{00F7}'),
-                    "infty" => out.push('\u{221E}'),
-                    "approx" => out.push('\u{2248}'),
-                    "equiv" => out.push('\u{2261}'),
-                    "neq" | "ne" => out.push('\u{2260}'),
-                    "leq" | "le" => out.push('\u{2264}'),
-                    "geq" | "ge" => out.push('\u{2265}'),
-                    "ll" => out.push('\u{226A}'),
-                    "gg" => out.push('\u{226B}'),
-                    "sim" => out.push('\u{223C}'),
-                    "propto" => out.push('\u{221D}'),
-                    "partial" => out.push('\u{2202}'),
-                    "nabla" => out.push('\u{2207}'),
-                    "sum" => out.push('\u{2211}'),
-                    "prod" => out.push('\u{220F}'),
-                    "int" => out.push('\u{222B}'),
-                    "oint" => out.push('\u{222E}'),
-                    "sqrt" => out.push('\u{221A}'),
-                    "degree" | "circ" => out.push('\u{00B0}'),
-                    // 文本模式: \mathrm, \text, \mathbf → 纯文本
-                    "mathrm" | "text" | "mathbf" | "mathcal" | "mathit" | "mathsf" | "mathtt" => {
-                        if i < chars.len() && chars[i] == '{' {
-                            i += 1;
-                            let content = extract_brace_group(&chars, &mut i);
-                            out.push_str(&latex_to_unicode(&content));
-                            i += 1;
-                        }
-                    }
-                    // 分数: \frac{a}{b} → (a)/(b)  或  用 Unicode 分割线
-                    "frac" => {
-                        if i < chars.len() && chars[i] == '{' {
-                            i += 1;
-                            let num = extract_brace_group(&chars, &mut i);
-                            i += 1; // skip }
-                            if i < chars.len() && chars[i] == '{' {
-                                i += 1;
-                                let den = extract_brace_group(&chars, &mut i);
-                                out.push_str(&format!(
-                                    "({})/({})",
-                                    latex_to_unicode(&num),
-                                    latex_to_unicode(&den)
-                                ));
-                                i += 1;
-                            } else {
-                                out.push_str(&latex_to_unicode(&num));
-                            }
-                        }
-                    }
-                    // 极限: \lim → lim
-                    "lim" => out.push_str("lim"),
-                    // 空格类
-                    "quad" | "qquad" => out.push(' '),
-                    // 无操作（忽略）
-                    "displaystyle" | "textstyle" | "scriptstyle" => {}
-                    // \boxed{...} → 提取内容（数学模式内）
-                    "boxed" => {
-                        if i < chars.len() && chars[i] == '{' {
-                            i += 1;
-                            let content = extract_brace_group(&chars, &mut i);
-                            out.push_str(&latex_to_unicode(&content));
-                            i += 1;
-                        }
-                    }
-                    // 换行: \\ → 换行（只在数学模式内部，align 等）
-                    // 未知命令 → 去掉反斜杠，保留命令名
-                    _ => {
-                        out.push_str(&cmd);
-                    }
-                }
-            }
-            // 花括号 — 数学模式中裸花括号跳过（已由分数/文本等处理）
-            '{' | '}' => {
-                i += 1;
-            }
-            // 其他字符
-            _ => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-
-    out
-}
-
-/// 从 chars[i..] 提取花括号组内容，i 前进到对应的 '}'
-fn extract_brace_group(chars: &[char], i: &mut usize) -> String {
-    let start = *i;
-    let mut depth = 1usize;
-    while *i < chars.len() && depth > 0 {
-        if chars[*i] == '{' {
-            depth += 1;
-        }
-        if chars[*i] == '}' {
-            depth -= 1;
-        }
-        if depth > 0 {
-            *i += 1;
-        }
-    }
-    chars[start..*i].iter().collect()
-}
-
-fn sub_to_unicode(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            '0' => '₀',
-            '1' => '₁',
-            '2' => '₂',
-            '3' => '₃',
-            '4' => '₄',
-            '5' => '₅',
-            '6' => '₆',
-            '7' => '₇',
-            '8' => '₈',
-            '9' => '₉',
-            'a' => 'ₐ',
-            'e' => 'ₑ',
-            'h' => 'ₕ',
-            'i' => 'ᵢ',
-            'j' => 'ⱼ',
-            'k' => 'ₖ',
-            'l' => 'ₗ',
-            'm' => 'ₘ',
-            'n' => 'ₙ',
-            'o' => 'ₒ',
-            'p' => 'ₚ',
-            'r' => 'ᵣ',
-            's' => 'ₛ',
-            't' => 'ₜ',
-            'u' => 'ᵤ',
-            'v' => 'ᵥ',
-            'x' => 'ₓ',
-            '+' => '₊',
-            '-' => '₋',
-            '=' => '₌',
-            '(' => '₍',
-            ')' => '₎',
-            _ => c,
-        })
-        .collect()
-}
-
-fn sup_to_unicode(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            '0' => '⁰',
-            '1' => '¹',
-            '2' => '²',
-            '3' => '³',
-            '4' => '⁴',
-            '5' => '⁵',
-            '6' => '⁶',
-            '7' => '⁷',
-            '8' => '⁸',
-            '9' => '⁹',
-            'a' => 'ᵃ',
-            'b' => 'ᵇ',
-            'c' => 'ᶜ',
-            'd' => 'ᵈ',
-            'e' => 'ᵉ',
-            'f' => 'ᶠ',
-            'g' => 'ᵍ',
-            'h' => 'ʰ',
-            'i' => 'ⁱ',
-            'j' => 'ʲ',
-            'k' => 'ᵏ',
-            'l' => 'ˡ',
-            'm' => 'ᵐ',
-            'n' => 'ⁿ',
-            'o' => 'ᵒ',
-            'p' => 'ᵖ',
-            'r' => 'ʳ',
-            's' => 'ˢ',
-            't' => 'ᵗ',
-            'u' => 'ᵘ',
-            'v' => 'ᵛ',
-            'w' => 'ʷ',
-            'x' => 'ˣ',
-            'y' => 'ʸ',
-            'z' => 'ᶻ',
-            '+' => '⁺',
-            '-' => '⁻',
-            '=' => '⁼',
-            '(' => '⁽',
-            ')' => '⁾',
-            _ => c,
-        })
-        .collect()
-}
-
-/// 字符串中所有字符是否均可转为下标/上标
-fn all_subscriptable(s: &str) -> bool {
-    s.chars().all(|c| sub_to_unicode_char(c) != c || c == ' ')
-}
-fn all_superscriptable(s: &str) -> bool {
-    s.chars().all(|c| sup_to_unicode_char(c) != c || c == ' ')
-}
-
-fn sub_to_unicode_char(c: char) -> char {
-    match c {
-        '0' => '₀',
-        '1' => '₁',
-        '2' => '₂',
-        '3' => '₃',
-        '4' => '₄',
-        '5' => '₅',
-        '6' => '₆',
-        '7' => '₇',
-        '8' => '₈',
-        '9' => '₉',
-        'a' => 'ₐ',
-        'e' => 'ₑ',
-        'h' => 'ₕ',
-        'i' => 'ᵢ',
-        'j' => 'ⱼ',
-        'k' => 'ₖ',
-        'l' => 'ₗ',
-        'm' => 'ₘ',
-        'n' => 'ₙ',
-        'o' => 'ₒ',
-        'p' => 'ₚ',
-        'r' => 'ᵣ',
-        's' => 'ₛ',
-        't' => 'ₜ',
-        'u' => 'ᵤ',
-        'v' => 'ᵥ',
-        'x' => 'ₓ',
-        '+' => '₊',
-        '-' => '₋',
-        '=' => '₌',
-        '(' => '₍',
-        ')' => '₎',
-        _ => c,
-    }
-}
-
-fn sup_to_unicode_char(c: char) -> char {
-    match c {
-        '0' => '⁰',
-        '1' => '¹',
-        '2' => '²',
-        '3' => '³',
-        '4' => '⁴',
-        '5' => '⁵',
-        '6' => '⁶',
-        '7' => '⁷',
-        '8' => '⁸',
-        '9' => '⁹',
-        'a' => 'ᵃ',
-        'b' => 'ᵇ',
-        'c' => 'ᶜ',
-        'd' => 'ᵈ',
-        'e' => 'ᵉ',
-        'f' => 'ᶠ',
-        'g' => 'ᵍ',
-        'h' => 'ʰ',
-        'i' => 'ⁱ',
-        'j' => 'ʲ',
-        'k' => 'ᵏ',
-        'l' => 'ˡ',
-        'm' => 'ᵐ',
-        'n' => 'ⁿ',
-        'o' => 'ᵒ',
-        'p' => 'ᵖ',
-        'r' => 'ʳ',
-        's' => 'ˢ',
-        't' => 'ᵗ',
-        'u' => 'ᵘ',
-        'v' => 'ᵛ',
-        'w' => 'ʷ',
-        'x' => 'ˣ',
-        'y' => 'ʸ',
-        'z' => 'ᶻ',
-        '+' => '⁺',
-        '-' => '⁻',
-        '=' => '⁼',
-        '(' => '⁽',
-        ')' => '⁾',
-        _ => c,
-    }
-}
-
-struct Renderer {
-    syntax_set: SyntaxSet,
-    theme_set: ThemeSet,
-}
-
-impl Renderer {
-    fn new() -> Self {
-        Self {
-            syntax_set: SyntaxSet::load_defaults_newlines(),
-            theme_set: ThemeSet::load_defaults(),
-        }
-    }
-
-    fn render(&self, md: &str) -> String {
-        // 预处理：化学方程式 HTML/LaTeX → Unicode 上下标
-        let md = preprocess_chemistry(md);
-
-        let mut opts = Options::empty();
-        opts.insert(Options::ENABLE_TABLES);
-        opts.insert(Options::ENABLE_STRIKETHROUGH);
-        opts.insert(Options::ENABLE_TASKLISTS);
-
-        let parser = Parser::new_ext(&md, opts);
-        let mut out = String::new();
-        let mut in_code = false;
-        let mut lang = String::new();
-        let mut code = String::new();
-
-        // 表格缓冲状态
-        let mut in_table = false;
-        let mut table_aligns: Vec<pulldown_cmark::Alignment> = Vec::new();
-        let mut table_rows: Vec<Vec<String>> = Vec::new();
-        let mut table_cur_row: Vec<String> = Vec::new();
-        let mut table_cur_cell = String::new();
-
-        // 列表状态：栈结构追踪嵌套列表 (kind, next_index)
-        // kind = Some(n) 有序, None 无序
-        let mut list_stack: Vec<(Option<u64>, u64)> = Vec::new();
-
-        // 链接状态
-        let mut link_url = String::new();
-
-        // 行内样式栈：追踪活跃的样式代码，关闭时恢复外层样式
-        let mut style_stack: Vec<&'static str> = Vec::new();
-
-        for ev in parser {
-            // ---- 表格缓冲模式 ----
-            if in_table {
-                match &ev {
-                    Event::Start(Tag::TableHead) => continue,
-                    Event::End(TagEnd::TableHead) => continue,
-                    Event::Start(Tag::TableRow) => {
-                        table_cur_row = Vec::new();
-                        continue;
-                    }
-                    Event::End(TagEnd::TableRow) => {
-                        if !table_cur_row.is_empty() {
-                            table_rows.push(std::mem::take(&mut table_cur_row));
-                        }
-                        continue;
-                    }
-                    Event::Start(Tag::TableCell) => {
-                        table_cur_cell = String::new();
-                        continue;
-                    }
-                    Event::End(TagEnd::TableCell) => {
-                        table_cur_row.push(std::mem::take(&mut table_cur_cell));
-                        continue;
-                    }
-                    Event::End(TagEnd::Table) => {
-                        out.push_str(&self.render_table(&table_aligns, &table_rows));
-                        out.push('\n');
-                        table_aligns.clear();
-                        table_rows.clear();
-                        in_table = false;
-                        continue;
-                    }
-                    Event::Text(t) => {
-                        table_cur_cell.push_str(t);
-                        continue;
-                    }
-                    Event::Code(c) => {
-                        table_cur_cell.push_str(&format!(
-                            "{}`{c}`{}",
-                            ColorTheme::CODE_INLINE,
-                            ColorTheme::RESET
-                        ));
-                        continue;
-                    }
-                    Event::Start(Tag::Emphasis) => {
-                        table_cur_cell.push_str(ColorTheme::ITALIC);
-                        continue;
-                    }
-                    Event::End(TagEnd::Emphasis) => {
-                        table_cur_cell.push_str(ColorTheme::RESET);
-                        continue;
-                    }
-                    Event::Start(Tag::Strong) => {
-                        table_cur_cell.push_str(ColorTheme::BOLD);
-                        continue;
-                    }
-                    Event::End(TagEnd::Strong) => {
-                        table_cur_cell.push_str(ColorTheme::RESET);
-                        continue;
-                    }
-                    _ => continue,
-                }
-            }
-
-            match ev {
-                // ---- 代码块 ----
-                Event::Start(Tag::CodeBlock(kind)) => {
-                    in_code = true;
-                    lang = match kind {
-                        pulldown_cmark::CodeBlockKind::Fenced(l) => l.to_string(),
-                        _ => String::new(),
-                    };
-                }
-                Event::End(TagEnd::CodeBlock) => {
-                    out.push_str(&self.code_block(&lang, &code));
-                    code.clear();
-                    in_code = false;
-                }
-                Event::Text(t) if in_code => code.push_str(&t),
-
-                // ---- 表格入口 ----
-                Event::Start(Tag::Table(aligns)) => {
-                    in_table = true;
-                    table_aligns = aligns;
-                    table_rows = Vec::new();
-                    table_cur_row = Vec::new();
-                    table_cur_cell = String::new();
-                }
-
-                // ---- 普通文本 ----
-                Event::Text(t) => out.push_str(&t),
-
-                // ---- 标题 ----
-                Event::Start(Tag::Heading { level, .. }) => {
-                    out.push_str(match level {
-                        pulldown_cmark::HeadingLevel::H1 => ColorTheme::HEADING_H1,
-                        pulldown_cmark::HeadingLevel::H2 => ColorTheme::HEADING_H2,
-                        pulldown_cmark::HeadingLevel::H3 => ColorTheme::HEADING_H3,
-                        _ => ColorTheme::BOLD,
-                    });
-                }
-                Event::End(TagEnd::Heading(_)) => {
-                    out.push_str(ColorTheme::RESET);
-                    out.push('\n');
-                }
-
-                // ---- 行内样式（样式栈确保嵌套不丢失）----
-                Event::Start(Tag::Emphasis) => {
-                    style_stack.push(ColorTheme::ITALIC);
-                    out.push_str(ColorTheme::ITALIC);
-                }
-                Event::End(TagEnd::Emphasis) => {
-                    style_stack.retain(|&s| s != ColorTheme::ITALIC);
-                    out.push_str(ColorTheme::RESET);
-                    for &s in &style_stack {
-                        out.push_str(s);
-                    }
-                }
-                Event::Start(Tag::Strong) => {
-                    style_stack.push(ColorTheme::BOLD);
-                    out.push_str(ColorTheme::BOLD);
-                }
-                Event::End(TagEnd::Strong) => {
-                    style_stack.retain(|&s| s != ColorTheme::BOLD);
-                    out.push_str(ColorTheme::RESET);
-                    for &s in &style_stack {
-                        out.push_str(s);
-                    }
-                }
-                Event::Code(c) => out.push_str(&format!(
-                    "{}`{c}`{}",
-                    ColorTheme::CODE_INLINE,
-                    ColorTheme::RESET
-                )),
-                Event::Start(Tag::Strikethrough) => {
-                    style_stack.push(ColorTheme::STRIKETHROUGH);
-                    out.push_str(ColorTheme::STRIKETHROUGH);
-                }
-                Event::End(TagEnd::Strikethrough) => {
-                    style_stack.retain(|&s| s != ColorTheme::STRIKETHROUGH);
-                    out.push_str(ColorTheme::RESET);
-                    for &s in &style_stack {
-                        out.push_str(s);
-                    }
-                }
-
-                // ---- 引用 ----
-                Event::Start(Tag::BlockQuote(_)) => out.push_str(ColorTheme::QUOTE),
-                Event::End(TagEnd::BlockQuote(_)) => out.push_str(ColorTheme::RESET),
-
-                // ---- 链接（样式栈保留外层样式）----
-                Event::Start(Tag::Link { dest_url, .. }) => {
-                    link_url = dest_url.to_string();
-                    style_stack.push(ColorTheme::LINK);
-                    style_stack.push(ColorTheme::UNDERLINE);
-                    out.push_str(ColorTheme::LINK);
-                    out.push_str(ColorTheme::UNDERLINE);
-                }
-                Event::End(TagEnd::Link) => {
-                    style_stack.retain(|&s| s != ColorTheme::LINK && s != ColorTheme::UNDERLINE);
-                    out.push_str(ColorTheme::RESET);
-                    for &s in &style_stack {
-                        out.push_str(s);
-                    }
-                    // 链接后附 URL
-                    out.push_str(&format!(
-                        "{} ({}){}",
-                        ColorTheme::DIM,
-                        link_url,
-                        ColorTheme::RESET
-                    ));
-                    link_url.clear();
-                }
-
-                // ---- 列表（栈追踪嵌套）----
-                Event::Start(Tag::List(number)) => {
-                    let start = number.unwrap_or(1);
-                    list_stack.push((number, start));
-                    // 嵌套缩进：每层 2 空格
-                    let indent = "  ".repeat(list_stack.len().saturating_sub(1));
-                    out.push_str(&indent);
-                }
-                Event::End(TagEnd::List(_)) => {
-                    list_stack.pop();
-                    // 最外层列表结束时加空行
-                    if list_stack.is_empty() {
-                        out.push('\n');
-                    }
-                }
-                Event::Start(Tag::Item) => {
-                    let indent = "  ".repeat(list_stack.len().saturating_sub(1));
-                    if let Some((kind, idx)) = list_stack.last_mut() {
-                        match kind {
-                            Some(_) => {
-                                // 有序列表：自动编号
-                                out.push_str(&format!(
-                                    "{indent}{bold}{accent}{idx}.{rst} ",
-                                    bold = ColorTheme::BOLD,
-                                    accent = ColorTheme::ACCENT,
-                                    rst = ColorTheme::RESET,
-                                ));
-                                *idx += 1;
-                            }
-                            None => {
-                                // 无序列表
-                                out.push_str(&format!(
-                                    "{indent}{bullet}·{rst} ",
-                                    bullet = ColorTheme::BULLET,
-                                    rst = ColorTheme::RESET,
-                                ));
-                            }
-                        }
-                    }
-                }
-                Event::End(TagEnd::Item) => out.push('\n'),
-
-                // ---- 任务列表 ----
-                Event::TaskListMarker(checked) => {
-                    if checked {
-                        out.push_str(&format!("{}[x]{} ", ColorTheme::SUCCESS, ColorTheme::RESET));
-                    } else {
-                        out.push_str(&format!("{}[ ]{} ", ColorTheme::DIM, ColorTheme::RESET));
-                    }
-                }
-
-                // ---- 段落 / 换行 ----
-                Event::End(TagEnd::Paragraph) => out.push('\n'),
-                Event::HardBreak => out.push('\n'),
-                Event::SoftBreak => out.push(' '),
-
-                _ => {}
-            }
-        }
-        out
-    }
-
-    /// 渲染表格：计算列宽 + 绘制 Unicode 制表符边框
-    fn render_table(&self, _aligns: &[pulldown_cmark::Alignment], rows: &[Vec<String>]) -> String {
-        if rows.is_empty() {
-            return String::new();
-        }
-
-        let ncols = rows.iter().map(|r| r.len()).max().unwrap_or(1);
-        // 计算每列的显示宽度（去除 ANSI 转义码）
-        let mut col_widths = vec![3usize; ncols]; // 最小 3
-        for row in rows {
-            for (ci, cell) in row.iter().enumerate() {
-                let w = visible_width(cell).max(3);
-                if w > col_widths[ci] {
-                    col_widths[ci] = w.min(50); // 单列最大 50
-                }
-            }
-        }
-
-        let mut out = String::new();
-        out.push('\n');
-
-        let is_header = !rows.is_empty();
-
-        for (ri, row) in rows.iter().enumerate() {
-            let is_hdr = ri == 0 && is_header;
-            // 顶部边框（仅表头行前）
-            if ri == 0 {
-                out.push_str(&table_border_top(&col_widths));
-            }
-            // 行内容
-            for (ci, w) in col_widths.iter().enumerate() {
-                let raw = row.get(ci).map(|s| s.as_str()).unwrap_or("");
-                // 超过列宽的单元格按可见宽度截断（补 …），保证右边框与顶部边框对齐
-                let cell = truncate_to_width(raw, *w);
-                let pad = visible_width(&cell);
-                let extra = if pad < *w { w - pad } else { 0 };
-                let pad_str = spacer(extra);
-                if is_hdr {
-                    out.push_str(&format!(
-                        "{dim}│{rst} {bold}{cell}{rst}{pad_str} ",
-                        dim = ColorTheme::DIM,
-                        rst = ColorTheme::RESET,
-                        bold = ColorTheme::BOLD,
-                    ));
-                } else {
-                    out.push_str(&format!(
-                        "{dim}│{rst} {cell}{pad_str} ",
-                        dim = ColorTheme::DIM,
-                        rst = ColorTheme::RESET,
-                    ));
-                }
-            }
-            out.push_str(&format!(
-                "{dim}│{rst}\n",
-                dim = ColorTheme::DIM,
-                rst = ColorTheme::RESET
-            ));
-
-            // 表头分隔线
-            if is_hdr {
-                out.push_str(&table_border_sep(&col_widths));
-            }
-        }
-        // 底部边框
-        out.push_str(&table_border_bottom(&col_widths));
-        out
-    }
-
-    fn code_block(&self, lang: &str, code: &str) -> String {
-        let syntax = if lang.is_empty() {
-            self.syntax_set.find_syntax_plain_text()
-        } else {
-            self.syntax_set
-                .find_syntax_by_token(lang)
-                .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text())
-        };
-        let theme = &self.theme_set.themes["base16-ocean.dark"];
-        let mut h = HighlightLines::new(syntax, theme);
-        // 框宽取「所有代码行的最大显示宽度」，且按显示宽度（CJK 记 2）而非
-        // 字节长度计算——否则含中文的代码行会让边框过宽且对不齐。
-        let w = code
-            .lines()
-            .map(|l| l.chars().map(char_display_width).sum::<usize>())
-            .max()
-            .unwrap_or(0)
-            .max(40);
-
-        let dim = ColorTheme::DIM;
-        let rst = ColorTheme::RESET;
-        let bg = ColorTheme::CODE_BG;
-
-        let mut out = String::new();
-        out.push_str(&format!("{dim}╭{}╮{rst}\n", "─".repeat(w + 2)));
-
-        for line in code.lines() {
-            match h.highlight_line(line, &self.syntax_set) {
-                Ok(ranges) => {
-                    let styled: String = ranges
-                        .iter()
-                        .map(|(s, t)| {
-                            format!(
-                                "\x1b[38;2;{};{};{}m{bg}{t}",
-                                s.foreground.r, s.foreground.g, s.foreground.b
-                            )
-                        })
-                        .collect();
-                    out.push_str(&format!("{dim}│{rst} {styled}{rst}\n"));
-                }
-                Err(_) => out.push_str(&format!("{dim}│{rst} {bg}{line}{rst}\n")),
-            }
-        }
-
-        out.push_str(&format!("{dim}╰{}╯{rst}\n", "─".repeat(w + 2)));
-        out
-    }
-}
-
-// =============================================================================
-// 表格渲染辅助
-// =============================================================================
-
-/// 计算字符串的可见字符宽度（跳过 ANSI 转义码）
-fn visible_width(s: &str) -> usize {
-    let mut w = 0usize;
-    let mut in_esc = false;
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if in_esc {
-            if bytes[i] == b'm' {
-                in_esc = false;
-            }
-            i += 1;
-            continue;
-        }
-        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
-            in_esc = true;
-            i += 2;
-            continue;
-        }
-        let ch = s[i..].chars().next().unwrap_or(' ');
-        w += char_display_width(ch);
-        i += ch.len_utf8();
-    }
-    w
-}
-
-/// 终端列宽：East Asian Wide/Fullwidth 计 2，其余计 1。
-/// 注意：箭头(→)、项目符号(•)、表格边框(│) 等符号虽码位 > 0x2000，但终端按 1 列显示，
-/// 不能简单按 `c > 0x2000` 判 2 列，否则填充多算导致表格列错位。
-fn char_display_width(c: char) -> usize {
-    let u = c as u32;
-    // 零宽字符
-    if u == 0 || (0x0300..=0x036F).contains(&u) {
-        return 0;
-    }
-    let wide = matches!(u,
-        0x1100..=0x115F |   // 谚文 Jamo
-        0x2E80..=0x303E |   // CJK 部首、康熙部首、CJK 符号与标点
-        0x3041..=0x33FF |   // 平假名、片假名、注音、CJK 兼容
-        0x3400..=0x4DBF |   // CJK 扩展 A
-        0x4E00..=0x9FFF |   // CJK 统一表意文字
-        0xA000..=0xA4CF |   // 彝文
-        0xAC00..=0xD7A3 |   // 谚文音节
-        0xF900..=0xFAFF |   // CJK 兼容表意文字
-        0xFE10..=0xFE19 |   // 竖排标点
-        0xFE30..=0xFE6F |   // CJK 兼容形式、小写变体
-        0xFF00..=0xFF60 |   // 全角 ASCII、全角标点
-        0xFFE0..=0xFFE6 |   // 全角符号
-        0x1F300..=0x1FAFF | // emoji 及符号
-        0x20000..=0x3FFFD   // CJK 扩展 B 及以上
-    );
-    if wide {
-        2
-    } else {
-        1
-    }
-}
-
-fn spacer(n: usize) -> String {
-    " ".repeat(n)
-}
-
-/// 将字符串按可见宽度截断到 `max`（含尾部 `…`），跳过 ANSI 转义码、尊重 CJK 宽度。
-/// 不含转义码且本身不超宽时原样返回；超宽时在末尾补一个宽度 1 的 `…`。
-fn truncate_to_width(s: &str, max: usize) -> String {
-    if visible_width(s) <= max {
-        return s.to_string();
-    }
-    // 需要截断：为 `…` 预留 1 列
-    let budget = max.saturating_sub(1);
-    let mut out = String::new();
-    let mut w = 0usize;
-    let mut in_esc = false;
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if in_esc {
-            out.push(bytes[i] as char);
-            if bytes[i] == b'm' {
-                in_esc = false;
-            }
-            i += 1;
-            continue;
-        }
-        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
-            out.push_str("\x1b[");
-            in_esc = true;
-            i += 2;
-            continue;
-        }
-        let ch = s[i..].chars().next().unwrap_or(' ');
-        let cw = char_display_width(ch);
-        if w + cw > budget {
-            break;
-        }
-        out.push(ch);
-        w += cw;
-        i += ch.len_utf8();
-    }
-    out.push('…');
-    out
-}
-
-fn table_border_top(widths: &[usize]) -> String {
-    let mut s = String::from(ColorTheme::DIM);
-    s.push('┌');
-    for (i, w) in widths.iter().enumerate() {
-        s.push_str(&"─".repeat(w + 2));
-        if i + 1 < widths.len() {
-            s.push('┬');
-        }
-    }
-    s.push('┐');
-    s.push_str(ColorTheme::RESET);
-    s.push('\n');
-    s
-}
-
-fn table_border_sep(widths: &[usize]) -> String {
-    let mut s = String::from(ColorTheme::DIM);
-    s.push('├');
-    for (i, w) in widths.iter().enumerate() {
-        s.push_str(&"─".repeat(w + 2));
-        if i + 1 < widths.len() {
-            s.push('┼');
-        }
-    }
-    s.push('┤');
-    s.push_str(ColorTheme::RESET);
-    s.push('\n');
-    s
-}
-
-fn table_border_bottom(widths: &[usize]) -> String {
-    let mut s = String::from(ColorTheme::DIM);
-    s.push('└');
-    for (i, w) in widths.iter().enumerate() {
-        s.push_str(&"─".repeat(w + 2));
-        if i + 1 < widths.len() {
-            s.push('┴');
-        }
-    }
-    s.push('┘');
-    s.push_str(ColorTheme::RESET);
-    s.push('\n');
-    s
-}
-
-// =============================================================================
-// rustyline Helper
-// =============================================================================
-
-struct ReplHelper {
-    bracket: MatchingBracketHighlighter,
-    validator: MatchingBracketValidator,
-    hinter: HistoryHinter,
-    commands: Vec<&'static str>,
-}
-
-impl ReplHelper {
-    fn new() -> Self {
-        Self {
-            bracket: MatchingBracketHighlighter::new(),
-            validator: MatchingBracketValidator::new(),
-            hinter: HistoryHinter::new(),
-            commands: vec!["/quit", "/exit", "/clear", "/compact", "/cost", "/help"],
-        }
-    }
-}
-
-impl Helper for ReplHelper {}
-
-impl Completer for ReplHelper {
-    type Candidate = Pair;
-
-    fn complete(
-        &self,
-        line: &str,
-        pos: usize,
-        _: &Context<'_>,
-    ) -> Result<(usize, Vec<Pair>), ReadlineError> {
-        if !line.starts_with('/') {
-            return Ok((0, vec![]));
-        }
-        let matches = self
-            .commands
-            .iter()
-            .filter(|c| c.starts_with(&line[..pos]))
-            .map(|c| Pair {
-                display: c.to_string(),
-                replacement: format!("{c} "),
-            })
-            .collect();
-        Ok((0, matches))
-    }
-}
-
-impl Hinter for ReplHelper {
-    type Hint = String;
-    fn hint(&self, line: &str, pos: usize, ctx: &Context<'_>) -> Option<String> {
-        self.hinter.hint(line, pos, ctx)
-    }
-}
-
-impl Highlighter for ReplHelper {
-    fn highlight<'l>(&self, line: &'l str, _: usize) -> Cow<'l, str> {
-        Cow::Borrowed(line)
-    }
-    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(&'s self, p: &'p str, _: bool) -> Cow<'b, str> {
-        Cow::Borrowed(p)
-    }
-    fn highlight_char(&self, line: &str, pos: usize, kind: CmdKind) -> bool {
-        self.bracket.highlight_char(line, pos, kind)
-    }
-}
-
-impl Validator for ReplHelper {
-    fn validate(
-        &self,
-        ctx: &mut rustyline::validate::ValidationContext,
-    ) -> Result<ValidationResult, ReadlineError> {
-        self.validator.validate(ctx)
-    }
-    fn validate_while_typing(&self) -> bool {
-        self.validator.validate_while_typing()
-    }
-}
-
-// =============================================================================
-// 工具事件解析
-// =============================================================================
-
-// =============================================================================
-// 流式 Markdown 渲染（延迟提交，参考 claw-code）
-// =============================================================================
-
-/// 累积流式文本，只在遇到"安全边界"（空行分隔的段落、闭合的代码围栏）时
-/// 提交渲染，已提交内容不再重绘。流结束时 flush 剩余部分。
-struct MarkdownStreamState {
-    pending: String,
-}
-
-impl MarkdownStreamState {
-    fn new() -> Self {
-        Self {
-            pending: String::new(),
-        }
-    }
-
-    /// 追加增量，返回本次可安全输出的已渲染 ANSI（可能为空）
-    fn push(&mut self, delta: &str, renderer: &Renderer) -> String {
-        self.pending.push_str(delta);
-        let boundary = find_stream_safe_boundary(&self.pending);
-        if boundary == 0 {
-            return String::new();
-        }
-        let committed: String = self.pending.drain(..boundary).collect();
-        // 规范化嵌套围栏：防止 LLM 输出的 markdown 代码示例破坏外层代码块
-        let safe = normalize_nested_fences(&committed);
-        renderer.render(&safe)
-    }
-
-    /// 渲染并清空剩余缓冲
-    fn flush(&mut self, renderer: &Renderer) -> String {
-        if self.pending.trim().is_empty() {
-            self.pending.clear();
-            return String::new();
-        }
-        let out = renderer.render(&self.pending);
-        self.pending.clear();
-        out
-    }
-}
-
-/// 解析行首的围栏开启标记，返回 `FenceMarker`，如果不是围栏行则返回 `None`。
-fn parse_fence_opener(line: &str) -> Option<FenceMarker> {
-    let trimmed = line.trim_start();
-    let ch = trimmed.chars().next()?;
-    if ch != '`' && ch != '~' {
-        return None;
-    }
-    let count = trimmed.chars().take_while(|&c| c == ch).count();
-    if count < 3 {
-        return None;
-    }
-    // 围栏后面只能是空白或语言标识符（不能跟同字符）
-    let after: String = trimmed[count..]
-        .chars()
-        .take_while(|&c| c != '\n' && c != '\r')
-        .collect();
-    if after.chars().any(|c| c == ch) {
-        return None; // 混杂字符，不是纯围栏
-    }
-    Some(FenceMarker {
-        character: ch,
-        length: count,
-    })
-}
-
-/// 检测嵌套代码围栏并自动扩展外层围栏。
-///
-/// LLM 可能在代码块内输出另一个 markdown 代码块（如示例文档），
-/// 导致流式渲染器提前关闭外层代码块。此函数检测这种情况并加长外层围栏。
-///
-/// 注意：此函数假设传入文本是已提交的"安全"块（不在未闭合围栏内）。
-fn normalize_nested_fences(text: &str) -> String {
-    // 收集所有围栏标记
-    let lines: Vec<&str> = text.lines().collect();
-    let mut fences: Vec<(usize, FenceMarker, bool)> = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
-        if let Some(fm) = parse_fence_opener(line) {
-            // 判断是开还是关：寻找栈顶匹配的
-            let is_close = fences.iter().rev().any(|(_, f, is_open)| {
-                *is_open && f.character == fm.character && f.length == fm.length
-            });
-            fences.push((i, fm, !is_close));
-        }
-    }
-
-    if fences.len() < 2 {
-        return text.to_string();
-    }
-
-    // 找出最大嵌套深度和所需最大围栏长度
-    let mut max_depth = 0usize;
-    let mut depth = 0usize;
-    let mut max_len = 3usize;
-    for (_, fm, is_open) in &fences {
-        if *is_open {
-            depth += 1;
-            max_depth = max_depth.max(depth);
-            max_len = max_len.max(fm.length);
-        } else {
-            depth = depth.saturating_sub(1);
-        }
-    }
-
-    // 如果最大深度 > 1（有嵌套），需要加长外层围栏
-    if max_depth <= 1 {
-        return text.to_string();
-    }
-
-    // 按嵌套深度分配围栏长度：外层比内层长，保证内层关闭围栏不会
-    // 误关外层。depth=1（最外层）最长，越往里越短，最里层保持原始长度
-    // （至少 3）。把「开/关」配对：用栈记录每个开围栏所在的深度，关围栏
-    // 沿用同一深度，从而成对加长。
-    let target_len = |depth: usize| -> usize {
-        // 最外层 depth=1 → max_len + max_depth - 1；最内层 depth=max_depth → max_len
-        max_len + (max_depth - depth)
-    };
-
-    let mut result = String::with_capacity(text.len() + fences.len() * 3);
-    let mut prev_line = 0usize;
-    let mut depth_stack: Vec<usize> = Vec::new();
-    let mut cur_depth = 0usize;
-
-    for (li, fm, is_open) in &fences {
-        let this_depth = if *is_open {
-            cur_depth += 1;
-            depth_stack.push(cur_depth);
-            cur_depth
-        } else {
-            let d = depth_stack.pop().unwrap_or(cur_depth);
-            cur_depth = cur_depth.saturating_sub(1);
-            d
-        };
-        let want = target_len(this_depth);
-
-        // 推入此围栏行之前的普通内容
-        for l in &lines[prev_line..*li] {
-            result.push_str(l);
-            result.push('\n');
-        }
-
-        if fm.length != want {
-            let old_fence: String = std::iter::repeat_n(fm.character, fm.length).collect();
-            let new_fence: String = std::iter::repeat_n(fm.character, want).collect();
-            let line = lines[*li].replacen(&old_fence, &new_fence, 1);
-            result.push_str(&line);
-        } else {
-            result.push_str(lines[*li]);
-        }
-        result.push('\n');
-        prev_line = *li + 1;
-    }
-    // 推入剩余的行
-    for l in &lines[prev_line..] {
-        result.push_str(l);
-        result.push('\n');
-    }
-
-    result
-}
-
-/// 返回可安全提交的字节位置：最后一个"不在未闭合代码围栏内"的空行结束处。
-///
-/// 升级版：使用 `FenceMarker` 区分 backtick 和 tilde 围栏，
-/// 避免 ``` 错误关闭 ~~~ 围栏（或反之）。
-fn find_stream_safe_boundary(s: &str) -> usize {
-    let mut fence_stack: Vec<FenceMarker> = Vec::new();
-    let mut safe_idx = 0usize;
-    let mut idx = 0usize;
-    for line in s.split_inclusive('\n') {
-        let trimmed = line.trim_end_matches(['\n', '\r']);
-        idx += line.len();
-
-        if let Some(fm) = parse_fence_opener(trimmed.trim_start()) {
-            // 检查是否匹配栈顶
-            if let Some(top) = fence_stack.last() {
-                if top.character == fm.character && top.length == fm.length {
-                    fence_stack.pop(); // 关闭围栏
-                } else {
-                    fence_stack.push(fm); // 不同围栏，嵌套
-                }
-            } else {
-                fence_stack.push(fm); // 开启围栏
-            }
-            continue;
-        }
-
-        if trimmed.trim().is_empty() && fence_stack.is_empty() {
-            safe_idx = idx;
-        }
-    }
-    safe_idx
-}
-
-// =============================================================================
-// 工具事件解析与美化
-// =============================================================================
-
-fn parse_tool_call(content: Option<&str>) -> (String, String) {
-    match content.and_then(|s| serde_json::from_str::<raven_types::ToolCall>(s).ok()) {
-        Some(tc) => (tc.function.name, tc.function.arguments),
-        None => ("tool".into(), String::new()),
-    }
-}
-
-fn parse_tool_result(content: Option<&str>) -> (String, String, bool) {
-    match content.and_then(|s| serde_json::from_str::<raven_types::ToolResult>(s).ok()) {
-        Some(tr) => (tr.name, tr.content, tr.is_error),
-        None => (String::new(), content.unwrap_or_default().into(), false),
-    }
-}
-
-/// 工具图标 —— 让工具调用一眼可辨（无图标时回退到通用符号）
-fn tool_icon(name: &str) -> &'static str {
-    match name {
-        "file_read" | "view" | "read" => "📄",
-        "file_write" | "write" => "✍",
-        "file_edit" | "edit" => "✏",
-        "search" | "grep" => "🔍",
-        "list_dir" | "ls" => "📂",
-        "shell" | "bash" | "exec" => "❯_",
-        "git" => "⎇",
-        "web_search" => "🌐",
-        "fetch_url" | "fetch" => "⬇",
-        _ => "◆",
-    }
-}
-
-/// 工具调用：单行摘要，工具图标 + spinner + 工具名 + 紧凑参数
-fn render_tool_call(name: &str, args: &str, spin_idx: u32) -> String {
-    let brief = brief_args(args);
-    let spin = spinner_frame(spin_idx);
-    let icon = tool_icon(name);
-    if brief.is_empty() {
-        format!(
-            "\n{accent}{spin}{rst} {icon} {bold}{name}{rst} {dim}(no args){rst}\n",
-            accent = ColorTheme::ACCENT,
-            spin = spin,
-            rst = ColorTheme::RESET,
-            bold = ColorTheme::BOLD,
-            dim = ColorTheme::DIM,
-            icon = icon,
-            name = name
-        )
-    } else {
-        format!(
-            "\n{accent}{spin}{rst} {icon} {bold}{name}{rst} {dim}{brief}{rst}\n",
-            accent = ColorTheme::ACCENT,
-            spin = spin,
-            rst = ColorTheme::RESET,
-            bold = ColorTheme::BOLD,
-            dim = ColorTheme::DIM,
-            icon = icon,
-            name = name,
-            brief = brief
-        )
-    }
-}
-
-/// 工具结果：缩进预览，成功灰色 / 失败红色高亮
-fn render_tool_result(_name: &str, output: &str, is_error: bool) -> String {
-    let preview = truncate_lines(output.trim_end(), 10);
-    let dim = ColorTheme::DIM;
-    let rst = ColorTheme::RESET;
-    if is_error {
-        format!(
-            "  {err}✗{rst} {dim}{preview}{rst}\n",
-            err = ColorTheme::ERROR,
-            rst = rst,
-            dim = dim
-        )
-    } else {
-        let mut out = String::new();
-        let mut lines = preview.lines();
-        if let Some(first) = lines.next() {
-            out.push_str(&format!("  {dim}└{rst} {dim}{first}{rst}\n"));
-        } else {
-            out.push_str(&format!("  {dim}└{rst}\n"));
-        }
-        for line in lines {
-            out.push_str(&format!("    {dim}{line}{rst}\n"));
-        }
-        out
-    }
-}
-
-/// 把 JSON 参数压成一行简短摘要（最多 ~60 字符）
-fn brief_args(args: &str) -> String {
-    let trimmed = args.trim();
-    if trimmed.is_empty() || trimmed == "{}" {
-        return String::new();
-    }
-    let compact = match serde_json::from_str::<serde_json::Value>(trimmed) {
-        Ok(serde_json::Value::Object(map)) => {
-            let parts: Vec<String> = map
-                .iter()
-                .map(|(k, v)| {
-                    let vs = match v {
-                        serde_json::Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    };
-                    format!("{k}={vs}")
-                })
-                .collect();
-            parts.join(" ")
-        }
-        _ => trimmed.to_string(),
-    };
-    let oneline: String = compact.split_whitespace().collect::<Vec<_>>().join(" ");
-    if oneline.chars().count() > 60 {
-        let s: String = oneline.chars().take(57).collect();
-        format!("{s}...")
-    } else {
-        oneline
-    }
-}
-
-fn truncate_lines(s: &str, max: usize) -> String {
-    let lines: Vec<&str> = s.lines().take(max).collect();
-    let cut = lines.len() < s.lines().count();
-    let mut r = lines.join("\n");
-    if cut {
-        r.push_str(" ...");
-    }
-    r
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ascii_width_is_one_per_char() {
-        assert_eq!(visible_width("hello"), 5);
-        assert_eq!(visible_width(""), 0);
-    }
-
-    #[test]
-    fn cjk_chars_are_two_columns() {
-        assert_eq!(visible_width("中文"), 4);
-        assert_eq!(visible_width("a中b"), 4); // 1 + 2 + 1
-    }
-
-    #[test]
-    fn symbols_above_0x2000_stay_one_column() {
-        // 回归：旧逻辑 `c > 0x2000 即算 2 列` 会把这些误判成 2，导致表格列错位
-        assert_eq!(char_display_width('→'), 1); // U+2192 箭头
-        assert_eq!(char_display_width('•'), 1); // U+2022 项目符号
-        assert_eq!(char_display_width('│'), 1); // U+2502 表格边框
-        assert_eq!(char_display_width('—'), 1); // U+2014 破折号
-        assert_eq!(char_display_width('“'), 1); // U+201C 左引号
-    }
-
-    #[test]
-    fn fullwidth_and_emoji_are_two_columns() {
-        assert_eq!(char_display_width('，'), 2); // U+FF0C 全角逗号
-        assert_eq!(char_display_width('🦀'), 2); // emoji
-    }
-
-    #[test]
-    fn ansi_escapes_have_zero_width() {
-        let styled = format!("{}中{}", ColorTheme::BOLD, ColorTheme::RESET);
-        assert_eq!(visible_width(&styled), 2);
+        println!(
+            "{dim}  /help 查看命令 · Ctrl+O 展开工具输出 · Ctrl+C 中断 · Ctrl+D 退出{rst}\n",
+            dim = dim,
+            rst = rst
+        );
     }
 }
