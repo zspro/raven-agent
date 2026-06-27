@@ -41,9 +41,11 @@ fn split_repo_and_file(path: &str) -> (String, String) {
 
 /// Git-first 管理器
 pub struct GitFirst {
-    enabled: bool,
+    /// 用 Atomic 存放，便于配置热重载在运行时（通过 `&self`）切换开关，
+    /// 无需 `&mut self` 或锁。
+    enabled: std::sync::atomic::AtomicBool,
     /// 是否自动提交（true=每次编辑后自动commit，false=手动commit）
-    auto_commit: bool,
+    auto_commit: std::sync::atomic::AtomicBool,
     /// 提交信息前缀
     commit_prefix: String,
 }
@@ -51,16 +53,34 @@ pub struct GitFirst {
 impl GitFirst {
     /// 创建 Git-first 管理器
     pub fn new(enabled: bool) -> Self {
+        use std::sync::atomic::AtomicBool;
         Self {
-            enabled,
-            auto_commit: enabled,
+            enabled: AtomicBool::new(enabled),
+            auto_commit: AtomicBool::new(enabled),
             commit_prefix: "raven".to_string(),
         }
     }
 
+    /// 运行时重新配置开关（供配置热重载调用）。
+    pub fn reconfigure(&self, enabled: bool, auto_commit: bool) {
+        use std::sync::atomic::Ordering;
+        self.enabled.store(enabled, Ordering::Relaxed);
+        self.auto_commit.store(auto_commit, Ordering::Relaxed);
+    }
+
+    /// 当前是否启用。
+    pub fn enabled(&self) -> bool {
+        self.enabled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 当前是否自动提交。
+    pub fn auto_commit(&self) -> bool {
+        self.auto_commit.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// 检查是否在 git 仓库中
     pub fn is_git_repo(&self, path: &std::path::Path) -> bool {
-        if !self.enabled {
+        if !self.enabled() {
             return false;
         }
         let repo_path = if path.is_file() {
@@ -83,7 +103,7 @@ impl GitFirst {
 
     /// 编辑前：保存当前状态（用于回滚）
     pub fn pre_edit(&self, path: &str) -> Result<Option<String>, String> {
-        if !self.enabled || !self.is_git_repo(std::path::Path::new(path)) {
+        if !self.enabled() || !self.is_git_repo(std::path::Path::new(path)) {
             return Ok(None);
         }
 
@@ -112,7 +132,7 @@ impl GitFirst {
         tool_name: &str,
         description: &str,
     ) -> Result<String, String> {
-        if !self.enabled || !self.auto_commit {
+        if !self.enabled() || !self.auto_commit() {
             return Ok("Git-first 已禁用".to_string());
         }
 

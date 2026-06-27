@@ -15,7 +15,7 @@ use context_engine::{ContextManager, ContextStats};
 use model_router::Router;
 use raven_types::*;
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tool_system::git_first::GitFirst;
 use tool_system::mcp::McpManager;
@@ -24,7 +24,10 @@ use tracing::{debug, info, warn};
 
 /// Agent 实例
 pub struct Agent {
-    config: Config,
+    /// 配置快照，用 `Arc<RwLock>` 持有以支持运行时热重载（见 `apply_config`）。
+    /// 读取都是短暂的字段 clone，不跨 await，故用 std 同步锁即可，
+    /// 同步方法（`config()`/`doctor()`）和异步方法都能直接用。
+    config: Arc<StdRwLock<Config>>,
     router: Arc<Router>,
     tools: Arc<Registry>,
     context: Arc<ContextManager>,
@@ -53,9 +56,11 @@ enum Gate {
 /// 权限检查器
 #[derive(Clone)]
 struct PermissionChecker {
-    mode: String,
-    allowed: Vec<String>,
-    denied: Vec<String>,
+    /// 用共享锁持有，使配置热重载能在运行时切换权限模式，
+    /// 且变更对已 clone 到流式任务中的副本同样可见。
+    mode: Arc<StdRwLock<String>>,
+    allowed: Arc<StdRwLock<Vec<String>>>,
+    denied: Arc<StdRwLock<Vec<String>>>,
     /// 本会话内"始终允许"的工具（用户选择 AllowAlways 后写入），避免反复打扰。
     session_allow: Arc<RwLock<HashSet<String>>>,
 }
@@ -103,9 +108,9 @@ impl Agent {
 
         // 创建权限检查器
         let permission = PermissionChecker {
-            mode: cfg.permission.mode.clone(),
-            allowed: cfg.permission.allowed_tools.clone(),
-            denied: cfg.permission.denied_tools.clone(),
+            mode: Arc::new(StdRwLock::new(cfg.permission.mode.clone())),
+            allowed: Arc::new(StdRwLock::new(cfg.permission.allowed_tools.clone())),
+            denied: Arc::new(StdRwLock::new(cfg.permission.denied_tools.clone())),
             session_allow: Arc::new(RwLock::new(HashSet::new())),
         };
 
@@ -146,7 +151,7 @@ impl Agent {
         info!("Agent 初始化完成，模型: {}", cfg.model);
 
         Ok(Self {
-            config: cfg,
+            config: Arc::new(StdRwLock::new(cfg)),
             router,
             tools,
             context,
@@ -268,7 +273,7 @@ impl Agent {
             .and_then(config_system::prompts::find_prompt)
             .map(|t| t.prompt)
             .unwrap_or_else(config_system::prompts::default_prompt);
-        let schemas = if self.permission.mode == "readonly" {
+        let schemas = if self.permission.is_readonly() {
             Vec::new()
         } else {
             self.collect_tool_schemas().await
@@ -281,7 +286,7 @@ impl Agent {
     pub async fn set_prompt_template(&self, name: &str) -> Result<String, String> {
         match config_system::prompts::find_prompt(name) {
             Some(template) => {
-                let schemas = if self.permission.mode == "readonly" {
+                let schemas = if self.permission.is_readonly() {
                     Vec::new()
                 } else {
                     self.collect_tool_schemas().await
@@ -318,7 +323,7 @@ impl Agent {
 
         // 检查是否有可用模型
         let models = self.router.list_models().await;
-        if models.is_empty() && self.config.api_key.is_none() {
+        if models.is_empty() && self.config.read().unwrap().api_key.is_none() {
             return Err(AgentError::config(
                 "没有可用的模型提供商",
                 "请设置 RAVEN_API_KEY 环境变量或在配置文件中指定 api_key",
@@ -333,7 +338,7 @@ impl Agent {
         // 故序列化全部消息（含历史）参与哈希。
         let messages_for_key = self.context.messages().await;
         let cache_key = ResponseCache::make_key(
-            &self.config.model,
+            &self.config.read().unwrap().model,
             &serde_json::to_string(&messages_for_key).unwrap_or_default(),
         );
         if let Some(cached) = self.cache.get(&cache_key).await {
@@ -355,21 +360,20 @@ impl Agent {
             }
 
             // 获取工具 schema（内置 + MCP，序列化为 JSON 值发送给 LLM）
-            let tool_schemas = if self.permission.mode == "readonly" {
+            let tool_schemas = if self.permission.is_readonly() {
                 Vec::new()
             } else {
                 self.collect_tool_schemas().await
             };
 
             // 调用 LLM
+            let model = self.config.read().unwrap().model.clone();
             let messages = self.context.messages().await;
             let resp = if tool_schemas.is_empty() {
-                self.router
-                    .chat(&self.config.model, &messages, None)
-                    .await?
+                self.router.chat(&model, &messages, None).await?
             } else {
                 self.router
-                    .chat(&self.config.model, &messages, Some(&tool_schemas))
+                    .chat(&model, &messages, Some(&tool_schemas))
                     .await?
             };
 
@@ -415,7 +419,7 @@ impl Agent {
         let input = user_input.into();
         let models = self.router.list_models().await;
 
-        if models.is_empty() && self.config.api_key.is_none() {
+        if models.is_empty() && self.config.read().unwrap().api_key.is_none() {
             return Err(AgentError::config(
                 "没有可用的模型提供商",
                 "请设置 RAVEN_API_KEY 环境变量",
@@ -431,7 +435,7 @@ impl Agent {
         let context = self.context.clone();
         let permission = self.permission.clone();
         let confirmer = self.confirmer.clone();
-        let model = self.config.model.clone();
+        let model = self.config.read().unwrap().model.clone();
         let mcp = self.mcp.clone();
 
         tokio::spawn(async move {
@@ -455,7 +459,7 @@ impl Agent {
                 }
 
                 // 获取工具（内置 + MCP）
-                let tool_schemas = if permission.mode == "readonly" {
+                let tool_schemas = if permission.is_readonly() {
                     Vec::new()
                 } else {
                     let mut s = tools.list_schemas().await;
@@ -611,9 +615,10 @@ impl Agent {
     /// 运行诊断
     pub fn doctor(&self) -> Vec<DoctorResult> {
         let mut results = Vec::new();
+        let cfg = self.config.read().unwrap();
 
         // API Key
-        if self.config.api_key.is_none() {
+        if cfg.api_key.is_none() {
             results.push(DoctorResult {
                 check: "API Key".to_string(),
                 status: "fail".to_string(),
@@ -633,7 +638,7 @@ impl Agent {
         results.push(DoctorResult {
             check: "模型".to_string(),
             status: "ok".to_string(),
-            message: self.config.model.clone(),
+            message: cfg.model.clone(),
             fix: None,
         });
 
@@ -641,7 +646,7 @@ impl Agent {
         results.push(DoctorResult {
             check: "提供商".to_string(),
             status: "ok".to_string(),
-            message: format!("{} 个提供商已注册", self.config.providers.len() + 1),
+            message: format!("{} 个提供商已注册", cfg.providers.len() + 1),
             fix: None,
         });
 
@@ -663,8 +668,8 @@ impl Agent {
         });
 
         // Git-first
-        let gf_status = if self.config.git_first.enabled {
-            if self.config.git_first.auto_commit {
+        let gf_status = if cfg.git_first.enabled {
+            if cfg.git_first.auto_commit {
                 "开启（自动提交）"
             } else {
                 "开启（手动提交）"
@@ -674,12 +679,7 @@ impl Agent {
         };
         results.push(DoctorResult {
             check: "Git-first".to_string(),
-            status: if self.config.git_first.enabled {
-                "ok"
-            } else {
-                "info"
-            }
-            .to_string(),
+            status: if cfg.git_first.enabled { "ok" } else { "info" }.to_string(),
             message: gf_status.to_string(),
             fix: None,
         });
@@ -698,7 +698,8 @@ impl Agent {
 
     /// 创建新会话
     pub async fn create_session(&self) -> String {
-        self.context.create_session(&self.config.model).await
+        let model = self.config.read().unwrap().model.clone();
+        self.context.create_session(&model).await
     }
 
     /// 加载会话
@@ -723,19 +724,19 @@ impl Agent {
 
     /// 获取当前配置
     pub fn config(&self) -> Config {
-        self.config.clone()
+        self.config.read().unwrap().clone()
     }
 
-    /// 更新模型
-    pub fn set_model(&mut self, model: impl Into<String>) {
-        self.config.model = model.into();
+    /// 更新模型（运行时生效，写回共享配置）
+    pub fn set_model(&self, model: impl Into<String>) {
+        self.config.write().unwrap().model = model.into();
     }
 
-    /// 更新权限模式
-    pub fn set_permission_mode(&mut self, mode: impl Into<String>) {
+    /// 更新权限模式（运行时生效，同步到权限检查器）
+    pub fn set_permission_mode(&self, mode: impl Into<String>) {
         let mode = mode.into();
-        self.config.permission.mode = mode.clone();
-        self.permission.mode = mode;
+        self.config.write().unwrap().permission.mode = mode.clone();
+        *self.permission.mode.write().unwrap() = mode;
     }
 
     /// 注入交互式确认回调（由 UI 层 CLI/TUI 提供）。
@@ -747,13 +748,59 @@ impl Agent {
     }
 
     /// 更新上下文配置
-    pub fn set_context_config(&mut self, ctx: raven_types::ContextConfig) {
-        self.config.context = ctx.clone();
+    pub fn set_context_config(&self, ctx: raven_types::ContextConfig) {
+        self.config.write().unwrap().context = ctx;
+    }
+
+    /// 应用一份新配置（配置热重载入口）。
+    ///
+    /// 把磁盘上重新加载的配置应用到运行中的 Agent，让以下场景无需重启即生效：
+    /// - 切换模型 / Base URL / API Key（重建 Router 的提供商）
+    /// - 调整权限模式与白/黑名单
+    /// - 开关 Git-first
+    ///
+    /// 不在覆盖范围（仍需重启）：MCP Server 重连、上下文预算/压缩阈值（已建对象不重置）。
+    pub async fn apply_config(&self, new_cfg: Config) {
+        // 1) 权限：模式 + 白/黑名单
+        *self.permission.mode.write().unwrap() = new_cfg.permission.mode.clone();
+        *self.permission.allowed.write().unwrap() = new_cfg.permission.allowed_tools.clone();
+        *self.permission.denied.write().unwrap() = new_cfg.permission.denied_tools.clone();
+
+        // 2) Git-first 开关
+        self.git_first
+            .reconfigure(new_cfg.git_first.enabled, new_cfg.git_first.auto_commit);
+
+        // 3) 提供商：清空后按新配置重新注册（覆盖 api_key/base_url/model 变更）
+        self.router.clear().await;
+        if new_cfg.api_key.is_some() {
+            if let Err(e) = self
+                .router
+                .register_default(
+                    new_cfg.api_key.clone(),
+                    new_cfg.base_url.clone(),
+                    new_cfg.model.clone(),
+                )
+                .await
+            {
+                warn!("热重载重新注册默认提供商失败: {}", e);
+            }
+        }
+        for p in &new_cfg.providers {
+            if let Err(e) = self.router.register_provider(p.clone()).await {
+                warn!("热重载重新注册提供商 {} 失败: {}", p.name, e);
+            }
+        }
+
+        // 4) 落盘到共享配置快照
+        let model = new_cfg.model.clone();
+        let mode = new_cfg.permission.mode.clone();
+        *self.config.write().unwrap() = new_cfg;
+        info!("配置已热重载生效: model={}, permission={}", model, mode);
     }
 
     /// 获取当前权限模式
-    pub fn permission_mode(&self) -> &str {
-        &self.permission.mode
+    pub fn permission_mode(&self) -> String {
+        self.permission.mode.read().unwrap().clone()
     }
 
     /// 获取可用工具列表
@@ -868,6 +915,11 @@ impl Agent {
 // =============================================================================
 
 impl PermissionChecker {
+    /// 当前是否只读模式。
+    fn is_readonly(&self) -> bool {
+        self.mode.read().unwrap().as_str() == "readonly"
+    }
+
     /// 三态权限门控。
     ///
     /// - `readonly`：写工具一律拒绝（schema 已不下发，这里再兜底）。
@@ -877,20 +929,22 @@ impl PermissionChecker {
     async fn gate(&self, tool_name: &str) -> Gate {
         let name = tool_name.to_string();
 
-        if self.denied.contains(&name) {
+        if self.denied.read().unwrap().contains(&name) {
             return Gate::Deny(format!(
                 "工具 '{tool_name}' 在 'permission.denied_tools' 黑名单中，已拒绝。"
             ));
         }
 
-        match self.mode.as_str() {
+        // 先取出模式字符串再释放锁，避免在 await 点持有 std 锁
+        let mode = self.mode.read().unwrap().clone();
+        match mode.as_str() {
             "readonly" => Gate::Deny(format!(
                 "只读模式（readonly）下不允许执行工具 '{tool_name}'。"
             )),
             "yes" | "auto" => Gate::Allow,
             // ask 模式（默认）
             _ => {
-                if self.allowed.contains(&name) {
+                if self.allowed.read().unwrap().contains(&name) {
                     return Gate::Allow;
                 }
                 if self.session_allow.read().await.contains(&name) {
@@ -990,9 +1044,12 @@ mod tests {
 
     fn checker(mode: &str) -> PermissionChecker {
         PermissionChecker {
-            mode: mode.to_string(),
-            allowed: vec!["file_read".to_string(), "search".to_string()],
-            denied: vec!["dangerous".to_string()],
+            mode: Arc::new(StdRwLock::new(mode.to_string())),
+            allowed: Arc::new(StdRwLock::new(vec![
+                "file_read".to_string(),
+                "search".to_string(),
+            ])),
+            denied: Arc::new(StdRwLock::new(vec!["dangerous".to_string()])),
             session_allow: Arc::new(RwLock::new(HashSet::new())),
         }
     }

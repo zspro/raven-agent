@@ -4,18 +4,27 @@
 //! 适用于：切换模型、调整权限、修改API Key 等场景。
 
 use crate::ConfigSystem;
+use raven_types::Config;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
+/// 配置变更时执行的回调（接收新配置）。返回 Future 以便异步应用（如重建提供商）。
+pub type ReloadCallback =
+    Arc<dyn Fn(Config) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
 /// 热重载管理器
 pub struct HotReload {
     config_system: Arc<RwLock<ConfigSystem>>,
     watch_paths: Vec<PathBuf>,
     last_modified: Arc<RwLock<Vec<Option<SystemTime>>>>,
+    /// 配置成功重载后回调（把新配置应用到运行中的 Agent）。
+    on_reload: Option<ReloadCallback>,
 }
 
 impl HotReload {
@@ -36,7 +45,14 @@ impl HotReload {
             config_system,
             watch_paths,
             last_modified: Arc::new(RwLock::new(last_modified)),
+            on_reload: None,
         }
+    }
+
+    /// 设置配置重载后的回调（用于把新配置应用到运行中的 Agent）。
+    pub fn on_reload(mut self, cb: ReloadCallback) -> Self {
+        self.on_reload = Some(cb);
+        self
     }
 
     /// 启动后台热重载任务
@@ -115,6 +131,11 @@ impl HotReload {
                     *guard = new_system;
                 }
 
+                // 把新配置应用到运行中的 Agent（如重建提供商、切换权限）
+                if let Some(cb) = &self.on_reload {
+                    cb(cfg.clone()).await;
+                }
+
                 info!(
                     "配置已重载: model={}, permission={}",
                     cfg.model, cfg.permission.mode
@@ -136,14 +157,18 @@ impl HotReload {
     }
 }
 
-/// 获取文件修改时间
-#[allow(dead_code)]
-fn get_modified_time(path: &PathBuf) -> Option<SystemTime> {
-    std::fs::metadata(path).ok()?.modified().ok()
-}
-
 /// 启动热重载（便捷函数）
 pub fn spawn_hot_reload(config_system: Arc<RwLock<ConfigSystem>>) {
     let reloader = HotReload::new(config_system);
+    reloader.spawn();
+}
+
+/// 启动热重载并在配置变更时回调（便捷函数）。
+/// 回调用于把新配置应用到运行中的 Agent。
+pub fn spawn_hot_reload_with_callback(
+    config_system: Arc<RwLock<ConfigSystem>>,
+    on_reload: ReloadCallback,
+) {
+    let reloader = HotReload::new(config_system).on_reload(on_reload);
     reloader.spawn();
 }

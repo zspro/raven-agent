@@ -182,6 +182,11 @@ impl Router {
         self.register_provider(config).await
     }
 
+    /// 清空所有已注册的提供商（用于配置热重载，清空后由调用方重新注册）。
+    pub async fn clear(&self) {
+        self.providers.write().await.clear();
+    }
+
     /// 发送聊天请求
     pub async fn chat(
         &self,

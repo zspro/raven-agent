@@ -179,6 +179,30 @@ async fn init_agent() -> Arc<Agent> {
     Arc::new(agent)
 }
 
+/// 为长时运行的场景（交互/serve/tui）启动配置热重载。
+///
+/// 检测到 `~/.raven/config.toml` 或项目 `.raven/config.toml` 变更后，
+/// 重新加载并调用 `Agent::apply_config`，让切模型/调权限/改 API Key 无需重启即生效。
+/// 单次执行（cmd_single）不需要，故不在 init_agent 内部启动。
+fn start_hot_reload(agent: &Arc<Agent>) {
+    use std::sync::Arc as StdArc;
+    use tokio::sync::RwLock as TokioRwLock;
+
+    let cfg_sys = match config_system::ConfigSystem::load() {
+        Ok(c) => c,
+        Err(_) => return, // 加载失败就不启热重载，不影响主流程
+    };
+    let shared = StdArc::new(TokioRwLock::new(cfg_sys));
+    let agent = agent.clone();
+    let callback: config_system::hot_reload::ReloadCallback = StdArc::new(move |new_cfg| {
+        let agent = agent.clone();
+        Box::pin(async move {
+            agent.apply_config(new_cfg).await;
+        })
+    });
+    config_system::hot_reload::spawn_hot_reload_with_callback(shared, callback);
+}
+
 /// 启动时检查是否有未完成的会话 checkpoint，交互式询问用户是否恢复。
 /// 非 TTY 环境直接跳过（不阻塞管道/CI）。
 async fn maybe_recover(agent: &Arc<Agent>) {
@@ -215,6 +239,7 @@ async fn cmd_chat() {
 /// 交互式对话；若 `opening` 非空，先把它作为第一句发出去再进入循环。
 async fn cmd_chat_with_opening(opening: String) {
     let agent = init_agent().await;
+    start_hot_reload(&agent);
 
     // 青色加粗标题 + 暗色命令提示，避免宽字符撑破对齐的方框
     println!("\n  \x1b[1;36mRaven 🐦‍⬛\x1b[0m  \x1b[2m交互式对话\x1b[0m");
@@ -377,6 +402,7 @@ async fn cmd_single(message: String) {
 /// 启动 HTTP 服务器
 async fn cmd_serve(host: String, port: u16) {
     let agent = init_agent().await;
+    start_hot_reload(&agent);
 
     println!("启动 HTTP API 服务器...");
     println!("地址: http://{}:{}", host, port);
@@ -474,6 +500,7 @@ async fn cmd_tui() {
 /// 启动 TUI，并把 opening 作为开场白首条消息（为空则不发）
 async fn cmd_tui_with_opening(opening: String) {
     let agent = init_agent().await;
+    start_hot_reload(&agent);
     if let Err(e) = tui::run(agent, opening) {
         eprintln!("TUI 错误: {}", e);
         std::process::exit(1);

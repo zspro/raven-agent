@@ -310,7 +310,11 @@ mod tests {
     #[test]
     fn compute_diff_detects_change() {
         let diff = compute_diff("a\nb\nc\n", "a\nB\nc\n");
-        assert!(diff.iter().any(|d| matches!(d, DiffLine::Old(t) if t == "b")));
-        assert!(diff.iter().any(|d| matches!(d, DiffLine::New(t) if t == "B")));
+        assert!(diff
+            .iter()
+            .any(|d| matches!(d, DiffLine::Old(t) if t == "b")));
+        assert!(diff
+            .iter()
+            .any(|d| matches!(d, DiffLine::New(t) if t == "B")));
     }
 }
