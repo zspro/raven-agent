@@ -618,7 +618,7 @@ async fn cmd_settings(agent: &raven_core::Agent) {
                     if !val.is_empty() {
                         if val.starts_with("sk-") || val.len() > 20 {
                             save_config_value(&config_path, "api_key", val);
-                            println!("✓ API Key 已保存，重启后生效");
+                            println!("✓ API Key 已保存，退出设置后生效");
                         } else {
                             println!("✗ API Key 格式不正确");
                         }
@@ -642,7 +642,7 @@ async fn cmd_settings(agent: &raven_core::Agent) {
                         println!("✓ Base URL 已清除，使用默认");
                     } else if val.starts_with("http") {
                         save_config_value(&config_path, "base_url", val);
-                        println!("✓ Base URL 已保存，重启后生效");
+                        println!("✓ Base URL 已保存，退出设置后生效");
                     } else {
                         println!("✗ URL 必须以 http:// 或 https:// 开头");
                     }
@@ -661,7 +661,7 @@ async fn cmd_settings(agent: &raven_core::Agent) {
                     let val = val.trim();
                     if !val.is_empty() {
                         save_config_value(&config_path, "model", val);
-                        println!("✓ 模型已保存，重启后生效");
+                        println!("✓ 模型已保存，退出设置后生效");
                     }
                 }
             }
@@ -680,7 +680,7 @@ async fn cmd_settings(agent: &raven_core::Agent) {
                     let valid = ["ask", "auto", "yes", "readonly"];
                     if valid.contains(&val) {
                         save_config_section(&config_path, "permission", "mode", val);
-                        println!("✓ 权限模式已保存，重启后生效");
+                        println!("✓ 权限模式已保存，退出设置后生效");
                     } else if !val.is_empty() {
                         println!("✗ 无效的模式: {}", val);
                     }
@@ -713,7 +713,7 @@ async fn cmd_settings(agent: &raven_core::Agent) {
                             "allowed_tools",
                             &format!("[{}]", formatted),
                         );
-                        println!("✓ 工具列表已保存，重启后生效");
+                        println!("✓ 工具列表已保存，退出设置后生效");
                     }
                 }
             }
@@ -834,17 +834,17 @@ async fn cmd_settings(agent: &raven_core::Agent) {
                         "1" => {
                             save_config_section(&config_path, "git_first", "enabled", "true");
                             save_config_section(&config_path, "git_first", "auto_commit", "true");
-                            println!("✓ Git-first 已开启（自动提交），重启后生效");
+                            println!("✓ Git-first 已开启（自动提交），退出设置后生效");
                         }
                         "2" => {
                             save_config_section(&config_path, "git_first", "enabled", "true");
                             save_config_section(&config_path, "git_first", "auto_commit", "false");
-                            println!("✓ Git-first 已开启（手动提交），重启后生效");
+                            println!("✓ Git-first 已开启（手动提交），退出设置后生效");
                         }
                         "3" => {
                             save_config_section(&config_path, "git_first", "enabled", "false");
                             save_config_section(&config_path, "git_first", "auto_commit", "false");
-                            println!("✓ Git-first 已关闭，重启后生效");
+                            println!("✓ Git-first 已关闭，退出设置后生效");
                         }
                         _ => println!("无效选择"),
                     }
@@ -864,6 +864,21 @@ async fn cmd_settings(agent: &raven_core::Agent) {
             }
             "q" | "Q" | "" => break,
             _ => println!("无效选择，请输入 1-12, s, d, q"),
+        }
+    }
+
+    // 退出设置时重新加载配置并应用到运行中的 Agent，使本次改动立即生效
+    // （无需等待热重载的 5 秒轮询，也无需重启）。
+    match config_system::ConfigSystem::load() {
+        Ok(sys) => {
+            agent.apply_config(sys.config().clone()).await;
+            println!("\x1b[2m配置已即时生效。\x1b[0m");
+        }
+        Err(e) => {
+            println!(
+                "\x1b[33m配置重新加载失败（{}），改动将在下次启动生效。\x1b[0m",
+                e
+            );
         }
     }
 }
@@ -956,7 +971,7 @@ models = [{}]
                     config_path,
                     format!("{}\n{}", content.trim_end(), provider_toml),
                 );
-                println!("✓ 提供商 '{}' 已添加，重启后生效", name);
+                println!("✓ 提供商 '{}' 已添加，退出设置后生效", name);
             }
             "d" | "D" => {
                 if cfg.providers.is_empty() {
@@ -969,7 +984,7 @@ models = [{}]
                 std::io::stdin().read_line(&mut num).unwrap();
                 if let Ok(n) = num.trim().parse::<usize>() {
                     if n > 0 && n <= cfg.providers.len() {
-                        println!("删除提供商 '{}'，重启后生效", cfg.providers[n - 1].name);
+                        println!("删除提供商 '{}'，退出设置后生效", cfg.providers[n - 1].name);
                         // 注：简单实现是让用户手动编辑文件
                         println!(
                             "(请手动编辑 {} 删除对应 [[providers]] 段)",
