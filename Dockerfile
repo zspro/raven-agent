@@ -4,10 +4,13 @@
 # =============================================================================
 # 构建阶段
 # =============================================================================
-# 注意：根 Cargo.toml 使用 resolver = "3"（需 Rust >= 1.84），
-# 且 Cargo.lock 为 v4 格式（需 Rust >= 1.78）。基础镜像必须足够新，
-# 否则 cargo 会因无法解析 resolver/lock 版本而构建失败。
-FROM rust:1.85-slim-bookworm AS builder
+# 基础镜像的 Rust 版本必须满足整个依赖树的 MSRV。当前 Cargo.lock 锁定的
+# 依赖中，最高要求来自 plist / time / time-core（需 rustc >= 1.88），其次是
+# icu_* / idna_adapter（需 1.86）；根 Cargo.toml 用 resolver = "3"（需 >= 1.84）、
+# Cargo.lock 为 v4（需 >= 1.78）。
+# 使用滚动 tag `rust:1-...`（始终为最新 1.x 稳定版），与 CI 的
+# `dtolnay/rust-toolchain@stable` 策略一致，避免日后依赖抬高 MSRV 时再次失效。
+FROM rust:1-slim-bookworm AS builder
 
 WORKDIR /build
 
