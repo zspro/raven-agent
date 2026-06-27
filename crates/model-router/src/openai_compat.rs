@@ -156,17 +156,43 @@ impl super::ProviderClient for OpenAICompatibleClient {
             // 积累流式 tool call chunks（OpenAI streaming API 分块发送参数）
             let mut tc_accum: std::collections::HashMap<usize, (String, String, String)> =
                 std::collections::HashMap::new(); // index → (id, name, arguments)
+                                                  // finish_reason 已到达但仍在等待可能单独发来的 usage chunk
+            let mut finished = false;
+            let mut done_sent = false;
 
             while let Some(event) = stream.next().await {
                 match event {
                     Ok(ev) => {
                         if ev.data == "[DONE]" {
                             let _ = tx.send(StreamEvent::done()).await;
+                            done_sent = true;
                             break;
                         }
 
                         match serde_json::from_str::<StreamChunk>(&ev.data) {
                             Ok(chunk) => {
+                                // Usage 可能随一个 choices 为空的独立 chunk 到达
+                                // （OpenAI include_usage），且常在 finish_reason 之后，
+                                // 故在 choices 之外、chunk 级别处理。
+                                if let Some(usage) = &chunk.usage {
+                                    let _ = tx
+                                        .send(StreamEvent::usage(TokenUsage {
+                                            input: usage.prompt_tokens as usize,
+                                            output: usage.completion_tokens as usize,
+                                            total: usage.total_tokens as usize,
+                                            cached: usage
+                                                .prompt_cache_hit_tokens
+                                                .map(|t| t as usize),
+                                        }))
+                                        .await;
+                                    // 已收尾且 usage 也到手，可以结束
+                                    if finished {
+                                        let _ = tx.send(StreamEvent::done()).await;
+                                        done_sent = true;
+                                        break;
+                                    }
+                                }
+
                                 if let Some(choice) = chunk.choices.first() {
                                     // 文本增量
                                     if let Some(content) = &choice.delta.content {
@@ -199,20 +225,6 @@ impl super::ProviderClient for OpenAICompatibleClient {
                                         }
                                     }
 
-                                    // Usage
-                                    if let Some(usage) = &chunk.usage {
-                                        let _ = tx
-                                            .send(StreamEvent::usage(TokenUsage {
-                                                input: usage.prompt_tokens as usize,
-                                                output: usage.completion_tokens as usize,
-                                                total: usage.total_tokens as usize,
-                                                cached: usage
-                                                    .prompt_cache_hit_tokens
-                                                    .map(|t| t as usize),
-                                            }))
-                                            .await;
-                                    }
-
                                     // 结束
                                     if choice.finish_reason.is_some() {
                                         // 发送积累的完整 tool calls
@@ -235,8 +247,9 @@ impl super::ProviderClient for OpenAICompatibleClient {
                                                 }
                                             }
                                         }
-                                        let _ = tx.send(StreamEvent::done()).await;
-                                        break;
+                                        // 不立即 break：可能还有单独的 usage chunk 在后面。
+                                        // 若本 chunk 已带 usage（上面已处理并 break），不会走到这里。
+                                        finished = true;
                                     }
                                 }
                             }
@@ -251,6 +264,11 @@ impl super::ProviderClient for OpenAICompatibleClient {
                         break;
                     }
                 }
+            }
+
+            // 流自然结束（无 [DONE]）时补发 done，避免下游永远等不到收尾事件。
+            if !done_sent {
+                let _ = tx.send(StreamEvent::done()).await;
             }
         });
 
