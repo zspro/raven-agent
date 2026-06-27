@@ -204,10 +204,14 @@ impl McpConnection {
 
         debug!("MCP -> {}: {}", self.name, req_json);
 
-        // 发送（带长度前缀，LSP 风格）
-        let msg = format!("Content-Length: {}\r\n\r\n{}", req_json.len(), req_json);
+        // MCP stdio 传输：按行分隔的 JSON-RPC（每条消息一行，结尾换行；
+        // 消息体内不得含换行）。注意不是 LSP 的 Content-Length 帧。
         self.stdin
-            .write_all(msg.as_bytes())
+            .write_all(req_json.as_bytes())
+            .await
+            .map_err(|e| format!("发送请求失败: {}", e))?;
+        self.stdin
+            .write_all(b"\n")
             .await
             .map_err(|e| format!("发送请求失败: {}", e))?;
         self.stdin
@@ -215,39 +219,32 @@ impl McpConnection {
             .await
             .map_err(|e| format!("刷新失败: {}", e))?;
 
-        // 读取响应头
-        let mut header = String::new();
+        // 读取响应：逐行读取，跳过空行与无法解析为 JSON-RPC 响应的行
+        // （部分 server 可能向 stdout 混入非协议日志）。
         loop {
-            header.clear();
-            match self.stdout.read_line(&mut header).await {
+            let mut body = String::new();
+            match self.stdout.read_line(&mut body).await {
                 Ok(0) => return Err("MCP Server 断开连接".to_string()),
                 Ok(_) => {
-                    if header.trim().is_empty() {
-                        break;
+                    let trimmed = body.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    debug!("MCP <- {}: {}", self.name, trimmed);
+                    match serde_json::from_str::<McpResponse>(trimmed) {
+                        Ok(resp) => {
+                            if let Some(err) = resp.error {
+                                return Err(format!("MCP 错误 [{}]: {}", err.code, err.message));
+                            }
+                            return resp.result.ok_or("空响应".to_string());
+                        }
+                        // 不是合法的 JSON-RPC 响应（如 server 日志行），跳过继续读
+                        Err(_) => continue,
                     }
                 }
-                Err(e) => return Err(format!("读取响应头失败: {}", e)),
+                Err(e) => return Err(format!("读取响应失败: {}", e)),
             }
         }
-
-        // 读取响应体
-        let mut body = String::new();
-        match self.stdout.read_line(&mut body).await {
-            Ok(0) => return Err("MCP Server 断开连接".to_string()),
-            Ok(_) => {}
-            Err(e) => return Err(format!("读取响应体失败: {}", e)),
-        }
-
-        debug!("MCP <- {}: {}", self.name, body.trim());
-
-        let resp: McpResponse =
-            serde_json::from_str(&body).map_err(|e| format!("解析响应失败: {}", e))?;
-
-        if let Some(err) = resp.error {
-            return Err(format!("MCP 错误 [{}]: {}", err.code, err.message));
-        }
-
-        resp.result.ok_or("空响应".to_string())
     }
 
     /// 初始化连接
@@ -260,14 +257,14 @@ impl McpConnection {
 
         self.request("initialize", Some(params)).await?;
 
-        // 发送 initialized 通知
+        // 发送 initialized 通知（按行分隔 JSON，与 request 帧格式一致）
         let notif = json!({
             "jsonrpc": "2.0",
             "method": "notifications/initialized",
         });
         let notif_json = serde_json::to_string(&notif).unwrap();
-        let msg = format!("Content-Length: {}\r\n\r\n{}", notif_json.len(), notif_json);
-        let _ = self.stdin.write_all(msg.as_bytes()).await;
+        let _ = self.stdin.write_all(notif_json.as_bytes()).await;
+        let _ = self.stdin.write_all(b"\n").await;
         let _ = self.stdin.flush().await;
 
         Ok(())
