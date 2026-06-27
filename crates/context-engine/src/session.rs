@@ -186,13 +186,22 @@ impl SessionStore {
 // 工具函数
 // =============================================================================
 
-/// 生成唯一会话 ID（时间戳 + 随机数）
+/// 生成唯一会话 ID（时间戳 + 进程内递增计数 + 纳秒熵）。
+///
+/// 旧实现用 `process::id()` 作为「随机」部分，但它在同一进程内恒定，
+/// 同一毫秒创建的两个会话会得到相同 ID。这里叠加一个进程内原子自增计数，
+/// 保证同进程内绝不重复；再混入纳秒位降低跨进程同毫秒碰撞概率。
 pub(crate) fn generate_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now()
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let rand = std::process::id();
-    format!("{:x}{:x}", ts, rand)
+        .unwrap_or_default();
+    let ts = now.as_millis();
+    let nanos = now.subsec_nanos();
+    let pid = std::process::id();
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{:x}{:x}{:x}{:x}", ts, pid, nanos, seq)
 }
